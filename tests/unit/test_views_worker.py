@@ -214,6 +214,115 @@ class TestViewsWorkerComplexDdls:
         assert "ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY amount DESC)" in replayed
 
 
+class TestViewDependencySkip:
+    """Finding #19: the UC views worker must cascade-skip a view that
+    references an object that was not migrated (a failed/skipped base
+    table), recording ``skipped_dependency_not_migrated`` instead of
+    hard-failing with TABLE_OR_VIEW_NOT_FOUND. Mirrors the proven Hive
+    behavior (finding #9) but with UC FQNs (real catalog names)."""
+
+    def test_backticked_dependency_matches(self):
+        from migrate.views_worker import view_dependency_skip
+
+        ddl = "CREATE OR REPLACE VIEW `cat`.`sch`.`v` AS SELECT * FROM `cat`.`sch`.`customers`"
+        not_migrated = {"`cat`.`sch`.`customers`"}
+        assert view_dependency_skip("`cat`.`sch`.`v`", ddl, not_migrated) == "`cat`.`sch`.`customers`"
+
+    def test_dotted_dependency_matches(self):
+        from migrate.views_worker import view_dependency_skip
+
+        ddl = "CREATE OR REPLACE VIEW cat.sch.v AS SELECT * FROM cat.sch.customers"
+        not_migrated = {"`cat`.`sch`.`customers`"}
+        assert view_dependency_skip("`cat`.`sch`.`v`", ddl, not_migrated) == "`cat`.`sch`.`customers`"
+
+    def test_no_dependency_returns_none(self):
+        from migrate.views_worker import view_dependency_skip
+
+        ddl = "CREATE OR REPLACE VIEW `cat`.`sch`.`v` AS SELECT * FROM `cat`.`sch`.`good`"
+        assert view_dependency_skip("`cat`.`sch`.`v`", ddl, {"`cat`.`sch`.`customers`"}) is None
+
+    def test_empty_not_migrated_never_skips(self):
+        from migrate.views_worker import view_dependency_skip
+
+        ddl = "CREATE OR REPLACE VIEW `cat`.`sch`.`v` AS SELECT * FROM `cat`.`sch`.`customers`"
+        assert view_dependency_skip("`cat`.`sch`.`v`", ddl, set()) is None
+
+    def test_view_own_fqn_excluded(self):
+        """A view whose own FQN is in not_migrated (re-run scenario) must
+        NOT self-skip — its own FQN appears in the CREATE header."""
+        from migrate.views_worker import view_dependency_skip
+
+        view_fqn = "`cat`.`sch`.`v_orders`"
+        ddl = "CREATE OR REPLACE VIEW `cat`.`sch`.`v_orders` AS SELECT * FROM `cat`.`sch`.`good`"
+        assert view_dependency_skip(view_fqn, ddl, {view_fqn}) is None
+
+    def test_dotted_prefix_boundary(self):
+        """not_migrated contains `orders`; DDL references `orders_2024` —
+        must NOT match (token boundary)."""
+        from migrate.views_worker import view_dependency_skip
+
+        ddl = "CREATE OR REPLACE VIEW `cat`.`sch`.`v` AS SELECT * FROM cat.sch.orders_2024"
+        assert view_dependency_skip("`cat`.`sch`.`v`", ddl, {"`cat`.`sch`.`orders`"}) is None
+
+
+class TestMigrateViewDependencyCascade:
+    """migrate_view records skipped_dependency_not_migrated (and does not
+    execute the DDL) when the view references a not-migrated object."""
+
+    def _make_deps(self, *, dry_run: bool = False) -> dict:
+        config = MagicMock()
+        config.dry_run = dry_run
+        return {
+            "config": config,
+            "auth": MagicMock(),
+            "tracker": MagicMock(),
+            "explorer": MagicMock(),
+            "wh_id": "wh-dep-1",
+        }
+
+    @patch("migrate.views_worker.execute_and_poll")
+    def test_view_on_not_migrated_table_is_skipped(self, mock_execute):
+        from migrate.views_worker import migrate_view
+
+        deps = self._make_deps()
+        deps[
+            "explorer"
+        ].get_create_statement.return_value = (
+            "CREATE VIEW `cat`.`sch`.`v_orders` AS SELECT * FROM `cat`.`sch`.`orders`"
+        )
+
+        result = migrate_view(
+            {"object_name": "`cat`.`sch`.`v_orders`"},
+            not_migrated_names={"`cat`.`sch`.`orders`"},
+            **deps,
+        )
+
+        assert result["status"] == "skipped_dependency_not_migrated"
+        assert "`cat`.`sch`.`orders`" in result["error_message"]
+        mock_execute.assert_not_called()
+
+    @patch("migrate.views_worker.execute_and_poll")
+    def test_view_on_migrated_table_proceeds(self, mock_execute):
+        from migrate.views_worker import migrate_view
+
+        mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s-ok"}
+        deps = self._make_deps()
+        deps[
+            "explorer"
+        ].get_create_statement.return_value = (
+            "CREATE VIEW `cat`.`sch`.`v_good` AS SELECT * FROM `cat`.`sch`.`orders`"
+        )
+
+        result = migrate_view(
+            {"object_name": "`cat`.`sch`.`v_good`"},
+            not_migrated_names=set(),
+            **deps,
+        )
+
+        assert result["status"] == "validated"
+        mock_execute.assert_called_once()
+
+
 class TestViewsWorkerRetryLoop:
     """Covers the retry-on-failure loop in ``views_worker.run()`` added
     to compensate for imperfect topological sort (view_table_usage
