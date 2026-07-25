@@ -18,36 +18,38 @@ except NameError:
 # COMMAND ----------
 # Registered Models Worker (Phase 3 Task 34).
 #
-# Two-phase per model:
+# Per model:
 #   (a) create the registered-model shell on target via the SDK
 #       (``registered_models.create``), and
-#   (b) for each source version, create the target version via MLflow's
-#       ``create_model_version(name, source, run_id)`` and let Unity
-#       Catalog ingest the artifacts from ``source`` into target-managed
-#       storage — then apply that version's aliases against the TARGET
-#       version number MLflow allocates.
+#   (b) for each source version: DOWNLOAD its artifacts to local disk via
+#       the SOURCE registry (``_download_source_artifacts``), then create
+#       the target version via MLflow's ``create_model_version(name,
+#       source=<local path>, run_id)`` (``_registry_client`` → target UC),
+#       then apply that version's aliases against the TARGET version number
+#       MLflow allocates.
 #
 # Why MLflow and not the SDK (finding #17): UC model versions are created
 # through MLflow, not ``databricks.sdk``. ``ModelVersionsAPI`` has no
 # ``create`` method (only delete/get/get_by_alias/list/update), so the
 # previous ``client.model_versions.create(...)`` raised AttributeError on
-# every version — the model migrated as an empty shell. MLflow's
-# create_model_version both allocates the version AND copies the artifacts,
-# so there is no separate byte-copy step.
+# every version — the model migrated as an empty shell.
 #
-# Execution model: the worker runs on the SOURCE workspace's compute (it
-# reads the source artifacts locally/natively) but the MLflow registry
-# client is pointed at the TARGET workspace's Unity Catalog registry
-# (``_registry_client``) — so the version lands on the target, mirroring
-# how ``auth.target_client`` targets the target for the SDK shell create.
+# Why stage-then-register (Option-2, proven live 2026-07-25): a direct
+# ``create_model_version`` pointed at the target but reading the SOURCE
+# metastore's ``abfss://unity-catalog@…`` storage FAILS — the target MLflow
+# client falls back to DefaultAzureCredential, which has no creds on
+# serverless ("Unable to download model artifacts … DefaultAzureCredential
+# failed to retrieve a token"). So we download via the SOURCE registry
+# first (UC vends creds for its own managed storage → local disk), then
+# register on the target from that local path (MLflow uploads it into
+# target-managed storage).
 #
-# ``source`` requirement: the target UC must be able to read the artifact
-# location handed to create_model_version. We prefer the version's
-# ``storage_location`` (the concrete UC-managed artifact dir, which
-# resolves reliably cross-workspace) and fall back to the original
-# ``source`` URI. When neither is readable the create fails; we surface
-# the offending URI and mark the row ``validation_failed`` so a re-run
-# retries after the operator grants access.
+# Execution model: the worker runs on SOURCE compute. The default MLflow
+# registry (``databricks-uc``) resolves against the source metastore for
+# the download; ``_registry_client`` is pointed at the TARGET for the
+# create — mirroring how ``auth.target_client`` targets the target for the
+# SDK shell create. Download or create failures surface in error_message
+# and mark the row ``validation_failed`` so a re-run retries.
 
 import json
 import logging
@@ -90,12 +92,50 @@ def _registry_client(auth: AuthManager):
     runtime, so it is imported lazily here — unit tests replace this whole
     function via the module seam and never import mlflow.
     """
+    # The migration SPN authenticates via OAuth (client_id/secret), so
+    # ``config.token`` is empty — building ``databricks://host:token`` from it
+    # yields ``databricks`` (ambient = SOURCE runtime), and the create then
+    # lands on / is denied by the source (proven live 2026-07-25:
+    # "host=<source>, auth_type=runtime … does not have CREATE MODEL VERSION").
+    # Vend a Bearer token from the target client's OAuth flow and set it as an
+    # env-based Databricks profile so MLflow authenticates AS the target SPN.
+    #
+    # NOTE ordering (see apply_model): this SETS DATABRICKS_HOST/TOKEN to the
+    # target. It must be called AFTER all source-side downloads, because the
+    # downloads rely on ambient (source) runtime auth — env pointing at target
+    # would send the download to the wrong workspace.
+    import os
+
     from mlflow.tracking import MlflowClient
 
     host = auth.config.target_workspace_url
-    token = auth.target_client.config.token
-    tracking_uri = f"databricks://{host}:{token}" if token else "databricks"
-    return MlflowClient(tracking_uri=tracking_uri, registry_uri="databricks-uc")
+    headers = auth.target_client.config.authenticate()  # {"Authorization": "Bearer <token>"}
+    bearer = headers.get("Authorization", "").split(" ", 1)[-1]
+    os.environ["DATABRICKS_HOST"] = host
+    os.environ["DATABRICKS_TOKEN"] = bearer
+    return MlflowClient(tracking_uri="databricks", registry_uri="databricks-uc")
+
+
+def _download_source_artifacts(auth: AuthManager, model_fqn: str, version: str) -> str:
+    """Download a source model version's artifacts to a local path.
+
+    Option-2 (stage-then-register): a target-pointed ``create_model_version``
+    reading the SOURCE metastore's ``abfss://unity-catalog@…`` storage fails
+    cross-metastore — the target client falls back to DefaultAzureCredential,
+    which has no creds on serverless (proven live 2026-07-25). Instead we
+    download the artifacts here via the SOURCE registry, where Unity Catalog
+    vends credentials for its own managed storage, then hand the returned
+    LOCAL path to the target registry's ``create_model_version`` (which
+    uploads into target-managed storage).
+
+    The worker runs on source-workspace compute, so MLflow's default registry
+    (``databricks-uc``) already resolves against the source metastore.
+    ``mlflow`` is runtime-only; imported lazily so unit tests inject this seam.
+    """
+    import mlflow
+
+    mlflow.set_registry_uri("databricks-uc")
+    return mlflow.artifacts.download_artifacts(artifact_uri=f"models:/{model_fqn}/{version}")
 
 
 def apply_model(
@@ -150,46 +190,80 @@ def apply_model(
         # IDEMPOTENT: model already exists, continue to versions + aliases
         pass
     except Exception as exc:  # noqa: BLE001
-        results.append(
-            {
-                "object_name": obj_key,
-                "object_type": "registered_model",
-                "status": "failed",
-                "error_message": str(exc),
-                "duration_seconds": time.time() - start,
-            }
-        )
-        return results
+        # The runtime doesn't always map an existing-model error to the
+        # AlreadyExists class — live it surfaced as a generic error
+        # "Routine or Model '<name>' already exists". Treat any
+        # already-exists message as idempotent (re-run) too.
+        if "already exists" in str(exc).lower():
+            pass
+        else:
+            results.append(
+                {
+                    "object_name": obj_key,
+                    "object_type": "registered_model",
+                    "status": "failed",
+                    "error_message": str(exc),
+                    "duration_seconds": time.time() - start,
+                }
+            )
+            return results
 
-    # MLflow registry client aimed at the target workspace's UC registry.
-    # create_model_version both allocates the version and ingests the
-    # artifacts from ``source`` — no separate byte-copy step (finding #17).
+    # Option-2 (stage-then-register), in two auth phases because MLflow auth
+    # is global env state and download needs SOURCE creds / register needs
+    # TARGET creds:
+    #   Phase A — download every version's artifacts to local disk using the
+    #     ambient (SOURCE) runtime auth. Do this BEFORE building the target
+    #     registry client (which sets DATABRICKS_HOST/TOKEN to target env).
+    #   Phase B — build the target registry client, then register each
+    #     downloaded version FROM its local path.
+    # A direct create_model_version from the source abfss:// URI fails
+    # cross-metastore (finding #17, proven live 2026-07-25).
     full_name = f"{catalog}.{schema}.{name}"
-    registry = _registry_client(auth)
-
-    # 2. Versions — create on target via MLflow. MLflow allocates its OWN
-    # target version numbers, so aliases are applied against the RETURNED
-    # version, never the source number.
     version_errors: list[str] = []
-    versions_created = 0
+
+    # Phase A — source-side downloads (ambient source auth; no target env yet).
+    staged: list[dict] = []  # {source_version, run_id, aliases, local_path}
     for v in model.get("versions", []):
         source_version = v.get("version", "?")
-        # Prefer the concrete UC-managed artifact dir (resolves reliably
-        # cross-workspace); fall back to the original registration URI.
+        # A version with no artifact location at all can't be moved
+        # (external / GC'd artifacts — scenario E).
         artifact_source = v.get("storage_location") or v.get("source") or ""
         if not artifact_source:
-            # Scenario E: nothing to register from (external/GC'd artifacts).
             version_errors.append(
                 f"v{source_version}: no artifact location (storage_location/source both empty); "
                 "register manually"
             )
             continue
+        try:
+            local_path = _download_source_artifacts(auth, model_fqn, source_version)
+        except Exception as exc:  # noqa: BLE001
+            version_errors.append(
+                f"v{source_version}: source artifact download failed "
+                f"(models:/{model_fqn}/{source_version}): {exc}"
+            )
+            continue
+        staged.append(
+            {
+                "source_version": source_version,
+                "run_id": v.get("run_id"),
+                "aliases": v.get("aliases") or [],
+                "local_path": local_path,
+            }
+        )
 
+    # Phase B — target registry client (sets target env), then register each
+    # staged version. MLflow allocates its OWN target version numbers, so
+    # aliases are applied against the RETURNED version, never the source one.
+    registry = _registry_client(auth)
+    versions_created = 0
+    for s in staged:
+        source_version = s["source_version"]
+        local_path = s["local_path"]
         try:
             created = registry.create_model_version(
                 name=full_name,
-                source=artifact_source,
-                run_id=v.get("run_id"),
+                source=local_path,
+                run_id=s["run_id"],
             )
             versions_created += 1
         except AlreadyExists as exc:  # noqa: BLE001
@@ -198,16 +272,14 @@ def apply_model(
             version_errors.append(f"v{source_version}: already exists ({exc})")
             continue
         except Exception as exc:  # noqa: BLE001
-            # Most commonly the target UC can't read ``artifact_source``.
-            # Surface the offending URI so the operator knows what to grant.
             version_errors.append(
-                f"v{source_version}: create_model_version failed (source={artifact_source}): {exc}"
+                f"v{source_version}: create_model_version failed (source={local_path}): {exc}"
             )
             continue
 
         # 3. Aliases — set against the TARGET version MLflow just allocated.
         target_version = int(created.version)
-        for alias in v.get("aliases") or []:
+        for alias in s["aliases"]:
             try:
                 client.registered_models.set_alias(
                     full_name=full_name,
