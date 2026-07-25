@@ -30,13 +30,15 @@ migrations, account consolidations, or moving between Azure regions.
   target's own DBFS root (gated on `migrate_hive_dbfs_root`)
 
 **Stateful services** (optional standalone jobs — run as needed)
-- **Vector Search** (`migrate_vector_search`) — Delta Sync indexes recreated +
-  re-embedded; Direct Access indexes skipped
-- **Online Tables** (`migrate_online_tables`) — converted to a Lakebase synced
-  table (legacy online tables are deprecated); provisions a paid Lakebase instance
 - **Lakeflow Connect** (`migrate_lfc`) — query-based + SaaS row_filter (clone
   history + row_filter boundary + unified view) and CDC/gateway (recreate,
   create-only); cross-workspace LFC is a cut-over, not in-place
+
+> **Vector Search and Online Tables are out of scope / unsupported.** The
+> `migrate_vector_search` and `migrate_online_tables` jobs still deploy with
+> the bundle but are **not part of the supported migration path** — they are
+> not covered by this documentation and should not be relied on. Migrate
+> Vector Search indexes and Online/synced tables out of band.
 
 **Not migrated by this tool** (see the user guide for the path)
 - **Materialized views & streaming tables** — hard-skipped
@@ -168,8 +170,8 @@ To change values later, edit your local `config.yaml` and redeploy —
 
 ### Operator flow
 
-The tool ships **three core jobs** (plus `discovery` and `pre_check`) and
-**three optional stateful-service jobs**. Run the core sequence first:
+The tool ships **three core jobs** (plus `discovery` and `pre_check`) and an
+optional **Lakeflow Connect** (`migrate_lfc`) job. Run the core sequence first:
 
 1. **`discovery`** — scans the source workspace and writes
    `discovery_inventory`. The `migrate_*` jobs depend on it
@@ -186,9 +188,10 @@ The tool ships **three core jobs** (plus `discovery` and `pre_check`) and
    row filters, column masks, customer-defined shares, policies,
    monitors, foreign catalogs, connections.
 
-Then, as needed, the **optional stateful-service jobs**:
-`migrate_vector_search`, `migrate_online_tables`, `migrate_lfc` (see
-Coverage and the [user guide](docs/user_guide.md), Steps 7–9).
+Then, as needed, the optional **`migrate_lfc`** job (see Coverage and the
+[user guide](docs/user_guide.md)). (`migrate_vector_search` /
+`migrate_online_tables` also deploy but are out of scope / unsupported — see
+Coverage.)
 
 Each `migrate_*` job is independent and standalone-runnable. They
 assume `discovery_inventory` has been populated by an earlier
