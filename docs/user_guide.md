@@ -78,7 +78,7 @@ methodology-driven.
 | **1a. Infrastructure / 1b. Identity** | Create the target workspace + UC metastore in the Account Console. Networking, Private Link, identity (SSO/SCIM), CMK. | Out of scope — operator/IaC. |
 | **2. UC & data migration** | External tables (fast), managed tables via DEEP CLONE (slow), views, functions, grants, governance. Validate integrity. | **Core of this tool** — `migrate_uc`, `migrate_hive`, `migrate_governance`. |
 | **3. Workspace assets** | Notebooks, jobs, policies, warehouses, dashboards, secrets. | **Terraform exporter** (Section 8). |
-| **4. Stateful services** | Vector Search, Online Tables, Lakeflow Connect, DLT, Model Serving, Apps, MLflow. | Optional tool jobs (VS/OT/LFC) + Terraform exporter (DLT/Model Serving/Apps) — Sections 7–8. |
+| **4. Stateful services** | Lakeflow Connect, DLT, Model Serving, Apps, MLflow. (Vector Search + Online Tables out of scope — migrate out of band.) | Optional `migrate_lfc` job + Terraform exporter (DLT/Model Serving/Apps) — Sections 7–8. |
 | **5. Validation & cutover** | Verify counts/rows/grants; update DNS/SSO/SCIM/integrations; enable new, disable old. | Section 9. |
 | **6. Decommission** | Dual-run grace period; archive audit logs; delete old workspace + Private Link. | Section 10. |
 
@@ -282,11 +282,14 @@ Section 8:
   separate.
 
 ### Available now via optional tool jobs (Section 7)
-- **Vector Search** (`migrate_vector_search`), **Online Tables**
-  (`migrate_online_tables` → Lakebase synced table), **Lakeflow Connect**
-  (`migrate_lfc`).
+- **Lakeflow Connect** (`migrate_lfc`).
 
 ### Not covered (out-of-band)
+- **Vector Search** and **Online Tables** — the `migrate_vector_search` /
+  `migrate_online_tables` jobs still deploy with the bundle but are **out of
+  scope / unsupported**; this guide does not cover them. Recreate Vector Search
+  indexes (re-embed from the migrated source table) and Online/synced tables
+  directly on target.
 - **Lakebase** (`pg_dump`/`pg_restore`), **Online Feature Store**, **Genie
   spaces**, **Agent Bricks**, **MLflow experiments / workspace-registry models**
   (`mlflow-export-import`).
@@ -434,10 +437,11 @@ databricks bundle deploy -t dev \
   --var migration_spn_id=<spn-application-id> \
   --profile source-workspace
 ```
-This creates eight workflows — `pre_check`, `discovery`, `migrate_uc`,
-`migrate_hive`, `migrate_governance`, `migrate_vector_search`,
-`migrate_online_tables`, `migrate_lfc` (plus integration tests) — the Lakeview
-dashboard, and the workspace `config.yaml`.
+This creates the workflows — `pre_check`, `discovery`, `migrate_uc`,
+`migrate_hive`, `migrate_governance`, `migrate_lfc` (plus integration tests) —
+the Lakeview dashboard, and the workspace `config.yaml`. (`migrate_vector_search`
+and `migrate_online_tables` also deploy but are out of scope / unsupported — see
+§4.)
 
 ---
 
@@ -445,8 +449,7 @@ dashboard, and the workspace `config.yaml`.
 
 Recommended order: `pre_check` → `discovery` → `pre_check` (again, for
 collisions) → `migrate_uc` → `migrate_hive` (if applicable) →
-`migrate_governance` → then the optional stateful jobs
-`migrate_vector_search` / `migrate_online_tables` / `migrate_lfc`.
+`migrate_governance` → then the optional `migrate_lfc` job.
 
 ### Step 1 — `pre_check`
 Validates connectivity, SPN grants, and (after discovery) target collisions.
@@ -486,21 +489,12 @@ Assumes target tables/views/volumes already exist. Replays tags, RLS, column
 masks, comments, monitors, customer shares, foreign catalogs, connections,
 policies. **Do not run against an empty target.**
 
-### Step 7 — `migrate_vector_search` (optional)
-Recreates **Delta Sync** Vector Search indexes and triggers re-embedding from
-the already-migrated source Delta table (run `migrate_uc` first). Re-embedding
-incurs compute cost proportional to table size. **Direct Access indexes are not
-migrated** (`skipped_direct_access_unsupported`). Custom embedding-model
-endpoints must exist on target first.
+> **Vector Search and Online Tables are out of scope / unsupported.** The
+> `migrate_vector_search` and `migrate_online_tables` jobs deploy with the
+> bundle but are not part of the supported path and are not documented here
+> (see §4). Recreate Vector Search indexes and Online/synced tables out of band.
 
-### Step 8 — `migrate_online_tables` (optional)
-Converts each legacy online table into a **Lakebase synced table** (legacy
-online tables are deprecated — creation is blocked platform-wide). Provisions a
-**paid** Lakebase instance that persists after migration. Requires the source
-Delta table on target with its primary key; incremental sync needs the
-`auto_cdf` preview. Consumer repoint is operator-owned.
-
-### Step 9 — `migrate_lfc` (optional)
+### Step 7 — `migrate_lfc` (optional)
 Migrates Lakeflow Connect ingestion pipelines (cross-workspace = cut-over, not
 in-place). **Tier 1** (query-based DB + SaaS row_filter): clone history →
 recreate with a `row_filter` cursor boundary → unified view. **Tier 2** (CDC /
@@ -510,7 +504,7 @@ the re-hydrate at cutover. SaaS cursor is a mandatory operator input
 (`lfc_target_connection_name`). Full detail: `migration_status` rows
 `lfc_table` / `lfc_pipeline` / `lfc_gateway` / `lfc_view`.
 
-### Step 10 — Verify
+### Step 8 — Verify
 ```sql
 SELECT object_type, status, COUNT(*) n
 FROM migration_tracking.cp_migration.migration_status
