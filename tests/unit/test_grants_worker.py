@@ -163,6 +163,91 @@ class TestReplayGrants:
         assert "PRINCIPAL_NOT_FOUND" in results[0]["error_message"]
 
 
+class TestGrantDependencySkip:
+    """Finding #19: the UC grants worker must not attempt grants on an
+    object that was not migrated (a failed/skipped table, or a foreign
+    catalog migrate_governance hasn't created yet) — it records
+    ``skipped_dependency_not_migrated`` instead of a noisy
+    TABLE/CATALOG_DOES_NOT_EXIST failure. Mirrors Hive finding #9."""
+
+    def test_grant_target_not_migrated_true(self):
+        from migrate.grants_worker import _grant_target_not_migrated
+
+        not_migrated = {"`cat`.`sch`.`orders`"}
+        assert _grant_target_not_migrated("`cat`.`sch`.`orders`", not_migrated) is True
+
+    def test_grant_target_not_migrated_false(self):
+        from migrate.grants_worker import _grant_target_not_migrated
+
+        not_migrated = {"`cat`.`sch`.`orders`"}
+        assert _grant_target_not_migrated("`cat`.`sch`.`good`", not_migrated) is False
+
+    def test_skipped_dependency_grant_row_shape(self):
+        from migrate.grants_worker import _skipped_dependency_grant_row
+
+        row = _skipped_dependency_grant_row("`cat`.`sch`.`orders`")
+        assert row["status"] == "skipped_dependency_not_migrated"
+        assert row["object_type"] == "grant"
+        assert "`cat`.`sch`.`orders`" in row["error_message"]
+
+    def test_run_skips_grants_for_not_migrated_table(self):
+        """A table whose migration_status is not 'validated' gets no grant
+        enumeration — a skipped_dependency_not_migrated row is recorded and
+        list_grants is never called for it."""
+        from migrate import grants_worker
+
+        inventory = [
+            MagicMock(
+                catalog_name="cat",
+                schema_name="sch",
+                object_name="`cat`.`sch`.`good`",
+                object_type="managed_table",
+            ),
+            MagicMock(
+                catalog_name="cat",
+                schema_name="sch",
+                object_name="`cat`.`sch`.`orders`",
+                object_type="managed_table",
+            ),
+        ]
+        spark = MagicMock()
+        spark.sql.return_value.collect.return_value = inventory
+
+        dbutils = MagicMock()
+        cfg = MagicMock()
+        cfg.dry_run = False
+        cfg.transfer_ownership = True
+        cfg.tracking_catalog = "trk"
+        cfg.tracking_schema = "sch"
+
+        with (
+            patch.object(grants_worker.MigrationConfig, "from_workspace_file", return_value=cfg),
+            patch.object(grants_worker, "AuthManager"),
+            patch.object(grants_worker, "TrackingManager") as mock_tm,
+            patch.object(grants_worker, "find_warehouse", return_value="wh"),
+            patch.object(grants_worker, "CatalogExplorer") as mock_exp,
+            patch.object(grants_worker, "replay_grants", return_value=[]),
+        ):
+            mock_tm.return_value.not_validated_object_names.return_value = {"`cat`.`sch`.`orders`"}
+            explorer = mock_exp.return_value
+            explorer.list_grants.return_value = []
+            grants_worker.run(dbutils, spark)
+
+        # list_grants must NOT be called for the not-migrated table
+        table_fqns_enumerated = [c.args[1] for c in explorer.list_grants.call_args_list]
+        assert "`cat`.`sch`.`orders`" not in table_fqns_enumerated
+        assert "`cat`.`sch`.`good`" in table_fqns_enumerated
+
+        # a skipped_dependency_not_migrated row was recorded for orders
+        recorded = [
+            r
+            for call in mock_tm.return_value.append_migration_status.call_args_list
+            for r in call.args[0]
+        ]
+        skipped = [r for r in recorded if r["status"] == "skipped_dependency_not_migrated"]
+        assert any("`cat`.`sch`.`orders`" in r["error_message"] for r in skipped)
+
+
 class TestGrantsWorkerSecurableCoverage:
     """Contract test: grants_worker processes every UC securable type
     that ``discovery_inventory`` tracks. If a new object type is added

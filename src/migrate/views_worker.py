@@ -22,6 +22,7 @@ except NameError:
 
 import json
 import logging
+import re
 import time
 
 from common.auth import AuthManager
@@ -53,6 +54,40 @@ def _is_notebook() -> bool:
 
 
 # COMMAND ----------
+# Dependency-skip helper (finding #19 — UC counterpart of Hive finding #9)
+
+
+def view_dependency_skip(view_fqn: str, ddl: str, not_migrated_names: set[str]) -> str | None:
+    """Return the FQN of a not-migrated object the view DDL references, else None.
+
+    Takes the view's own FQN to exclude it from consideration (a view's own
+    FQN appears in the ``CREATE OR REPLACE VIEW <fqn> AS …`` header and must
+    not self-match on re-runs when the view has a non-validated status).
+
+    Matching rules (identical to the Hive worker):
+    - Backticked form (e.g. `` `cat`.`sch`.`t` ``): plain substring search —
+      backtick boundaries prevent prefix collisions.
+    - Dotted/unquoted form (e.g. ``cat.sch.t``): requires the match NOT be
+      immediately followed by an identifier character (``[A-Za-z0-9_]``) so
+      ``orders`` does not match inside ``orders_2024``.
+
+    A view referencing any not-migrated object is cascade-skipped (finding #19)
+    rather than hard-failing with TABLE_OR_VIEW_NOT_FOUND.
+    """
+    own_dotted = view_fqn.strip("`").replace("`.`", ".")
+
+    for fqn in not_migrated_names:
+        dotted = fqn.strip("`").replace("`.`", ".")
+        if dotted == own_dotted:
+            continue
+        if fqn in ddl:
+            return fqn
+        if re.search(re.escape(dotted) + r"(?![A-Za-z0-9_])", ddl):
+            return fqn
+    return None
+
+
+# COMMAND ----------
 # Migrate a single view
 
 
@@ -64,8 +99,13 @@ def migrate_view(
     tracker: TrackingManager,
     explorer: CatalogExplorer,
     wh_id: str,
+    not_migrated_names: set[str] | None = None,
 ) -> dict:
-    """Migrate a single view to the target workspace."""
+    """Migrate a single view to the target workspace.
+
+    If the view references an object that was not migrated (finding #19),
+    record ``skipped_dependency_not_migrated`` and do not execute the DDL.
+    """
     obj_name = view_info["object_name"]
 
     tracker.append_migration_status(
@@ -96,6 +136,16 @@ def migrate_view(
             "status": "failed",
             "error_message": f"Failed to get DDL: {exc}",
             "duration_seconds": duration,
+        }
+
+    dep = view_dependency_skip(obj_name, ddl, not_migrated_names or set())
+    if dep is not None:
+        return {
+            "object_name": obj_name,
+            "object_type": "view",
+            "status": "skipped_dependency_not_migrated",
+            "error_message": f"depends on not-migrated object {dep}",
+            "duration_seconds": time.time() - start,
         }
 
     # Replace CREATE VIEW with CREATE OR REPLACE VIEW
@@ -163,6 +213,10 @@ def run(dbutils, spark) -> None:
 
     wh_id = find_warehouse(auth)
 
+    # Objects whose latest migration_status is not 'validated' — a view
+    # referencing any of these is cascade-skipped (finding #19).
+    not_migrated_names = tracker.not_validated_object_names(source_type="uc")
+
     # Process views in dependency order. view_table_usage does not exist in
     # UC, so topological sort is best-effort (parsed from view_definition) —
     # any missed dependency edges are caught by the retry loop below: if a
@@ -188,6 +242,7 @@ def run(dbutils, spark) -> None:
                     tracker=tracker,
                     explorer=explorer,
                     wh_id=wh_id,
+                    not_migrated_names=not_migrated_names,
                 )
             except Exception as exc:  # noqa: BLE001
                 res = {
@@ -200,9 +255,13 @@ def run(dbutils, spark) -> None:
             if res["status"] == "validated":
                 pass_progress = True
                 final_by_fqn[fqn] = res
-            elif res["status"] == "skipped":
-                # dry_run or similar — keep as final, no retry
+            elif res["status"] in ("skipped", "skipped_dependency_not_migrated"):
+                # dry_run or a cascade-skip (finding #19) — terminal, no retry.
+                # A cascade-skipped view becomes a not-migrated dependency for
+                # later views in dependency order (transitive cascade).
                 final_by_fqn[fqn] = res
+                if res["status"] == "skipped_dependency_not_migrated":
+                    not_migrated_names.add(fqn)
             else:
                 # failed — possibly missing upstream. Keep the last attempt
                 # recorded but try again on next pass.

@@ -48,6 +48,27 @@ def _is_notebook() -> bool:
 
 
 # COMMAND ----------
+# Dependency-skip helpers (finding #19 — UC counterpart of Hive finding #9)
+
+
+def _grant_target_not_migrated(object_name: str, not_migrated_names: set[str]) -> bool:
+    """True when a per-object grant's target was not migrated (finding #19)."""
+    return object_name in not_migrated_names
+
+
+def _skipped_dependency_grant_row(object_name: str) -> dict:
+    """migration_status row for a grant skipped because its target object was
+    not migrated (finding #19) — recorded skipped, not failed."""
+    return {
+        "object_name": f"GRANT_SKIPPED_{object_name}",
+        "object_type": "grant",
+        "status": "skipped_dependency_not_migrated",
+        "error_message": f"target object {object_name} was not migrated; grants skipped",
+        "duration_seconds": 0.0,
+    }
+
+
+# COMMAND ----------
 # Replay grants
 
 
@@ -252,12 +273,27 @@ def run(dbutils, spark) -> None:
 
     wh_id = find_warehouse(auth)
 
+    # Object names whose latest migration_status is not 'validated'. A
+    # per-object grant on any of these (a failed/skipped table, or a
+    # foreign catalog migrate_governance hasn't created yet) is
+    # cascade-skipped rather than hard-failing (finding #19).
+    not_migrated_names = tracker.not_validated_object_names(source_type="uc")
+
     all_results: list[dict] = []
 
-    def _process(securable_type: str, fqn: str) -> None:
+    def _process(securable_type: str, fqn: str, *, object_level: bool = False) -> None:
         """Enumerate + replay grants for a single securable. Records
         a ``failed`` row on enumeration error so the gap surfaces in
-        migration_status rather than being silently swallowed."""
+        migration_status rather than being silently swallowed.
+
+        For object-level securables (``object_level=True``) whose target
+        was not migrated, records ``skipped_dependency_not_migrated`` and
+        skips enumeration (finding #19). Catalog/schema grants are never
+        cascade-skipped — they aren't per-migrated-object."""
+        if object_level and _grant_target_not_migrated(fqn, not_migrated_names):
+            logger.info("Skipping grants for not-migrated object %s.", fqn)
+            all_results.append(_skipped_dependency_grant_row(fqn))
+            return
         try:
             grants = explorer.list_grants(securable_type, fqn)
             grant_results = replay_grants(
@@ -301,16 +337,16 @@ def run(dbutils, spark) -> None:
         _process("SCHEMA", schema_fqn)
 
     for fqn in sorted(tables):
-        _process("TABLE", fqn)
+        _process("TABLE", fqn, object_level=True)
 
     for fqn in sorted(views):
-        _process("VIEW", fqn)
+        _process("VIEW", fqn, object_level=True)
 
     for fqn in sorted(volumes):
-        _process("VOLUME", fqn)
+        _process("VOLUME", fqn, object_level=True)
 
     for fqn in sorted(functions):
-        _process("FUNCTION", fqn)
+        _process("FUNCTION", fqn, object_level=True)
 
     # Record final statuses
 

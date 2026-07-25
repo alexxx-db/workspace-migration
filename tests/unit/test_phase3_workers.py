@@ -497,20 +497,33 @@ class TestMonitorsWorker:
 
 
 class TestModelsWorker:
-    @patch("migrate.models_worker.run_target_file_copy")
-    @patch("migrate.models_worker.ensure_copy_notebook_on_target")
+    """Model migration via MLflow (finding #17). ``_registry_client`` is
+    the seam pointed at the target UC registry; tests inject a fake so no
+    real mlflow import or SDK model_versions.create is exercised."""
+
+    @staticmethod
+    def _fake_registry(target_versions=("1",)):
+        reg = MagicMock()
+        created = []
+
+        def _create(name, source, run_id=None, **kwargs):
+            mv = MagicMock()
+            mv.version = target_versions[len(created)] if len(created) < len(target_versions) else str(len(created) + 1)
+            created.append({"name": name, "source": source, "run_id": run_id})
+            return mv
+
+        reg.create_model_version.side_effect = _create
+        return reg
+
     @patch("migrate.models_worker.time")
-    def test_creates_model_with_versions_aliases_and_artifact_copy(self, mock_time, mock_ensure, mock_copy):
+    def test_creates_model_with_versions_and_aliases(self, mock_time, monkeypatch):
         from migrate.models_worker import apply_model
 
         mock_time.time.side_effect = [100.0, 110.0]
-        mock_copy.return_value = {"bytes_copied": 12345, "file_count": 3}
+        reg = self._fake_registry(("1",))
+        monkeypatch.setattr("migrate.models_worker._registry_client", lambda a: reg)
         auth = MagicMock()
         auth.target_client.registered_models.create.return_value = MagicMock()
-        created_version = MagicMock()
-        created_version.storage_location = "abfss://target/.../m1/v1"
-        auth.target_client.model_versions.create.return_value = created_version
-        auth.target_client.registered_models.set_alias.return_value = MagicMock()
 
         results = apply_model(
             {
@@ -519,8 +532,9 @@ class TestModelsWorker:
                 "versions": [
                     {
                         "version": 1,
-                        "source": "run:/abc/art",
+                        "source": "runs:/abc/art",
                         "storage_location": "abfss://source/.../m1/v1",
+                        "run_id": "abc",
                         "aliases": ["prod"],
                     },
                 ],
@@ -530,35 +544,30 @@ class TestModelsWorker:
         )
         assert len(results) == 1
         assert results[0]["status"] == "validated"
-        # Artifact-copy outcome surfaced in the message.
-        assert "3 file(s)" in results[0]["error_message"]
-        assert "12345 byte(s)" in results[0]["error_message"]
-        # Copy helper called with source URI → target allocated path.
-        mock_copy.assert_called_once()
-        call_kwargs = mock_copy.call_args.kwargs
-        assert call_kwargs["src_path"] == "abfss://source/.../m1/v1"
-        assert call_kwargs["dst_path"] == "abfss://target/.../m1/v1"
+        assert "1 version(s) created" in results[0]["error_message"]
+        # Version created via MLflow from the storage_location.
+        reg.create_model_version.assert_called_once()
+        _, kwargs = reg.create_model_version.call_args
+        assert kwargs["name"] == "c.s.m1"
+        assert kwargs["source"] == "abfss://source/.../m1/v1"
         auth.target_client.registered_models.set_alias.assert_called_once_with(
             full_name="c.s.m1",
             alias="prod",
             version_num=1,
         )
 
-    @patch("migrate.models_worker.run_target_file_copy")
-    @patch("migrate.models_worker.ensure_copy_notebook_on_target")
     @patch("migrate.models_worker.time")
-    def test_idempotent_on_already_exists(self, mock_time, mock_ensure, mock_copy):
+    def test_idempotent_on_already_exists(self, mock_time, monkeypatch):
         from databricks.sdk.errors import AlreadyExists
 
         from migrate.models_worker import apply_model
 
         mock_time.time.side_effect = [100.0, 101.0]
-        mock_copy.return_value = {"bytes_copied": 0, "file_count": 0}
+        monkeypatch.setattr("migrate.models_worker._registry_client", lambda a: self._fake_registry())
         auth = MagicMock()
         auth.target_client.registered_models.create.side_effect = AlreadyExists(
             "RESOURCE_ALREADY_EXISTS"
         )
-        auth.target_client.model_versions.create.return_value = MagicMock()
 
         results = apply_model(
             {"model_fqn": "c.s.m1", "versions": []},
@@ -566,75 +575,6 @@ class TestModelsWorker:
             dry_run=False,
         )
         assert results[0]["status"] == "validated"
-
-    @patch("migrate.models_worker.run_target_file_copy")
-    @patch("migrate.models_worker.ensure_copy_notebook_on_target")
-    @patch("migrate.models_worker.time")
-    def test_artifact_copy_failure_hard_fails(self, mock_time, mock_ensure, mock_copy):
-        """L4: artifact copy failure now hard-fails (matches volume_worker).
-
-        Previously this returned ``validation_failed`` with a warning;
-        the artifact bytes are essential, not best-effort, so a copy
-        failure marks the row ``failed`` so operators don't miss it.
-        """
-        from migrate.models_worker import apply_model
-
-        mock_time.time.side_effect = [100.0, 105.0]
-        mock_copy.side_effect = RuntimeError(
-            "Target copy job failed (model_artifact_copy__c.s.m1__v1): PERMISSION_DENIED"
-        )
-        auth = MagicMock()
-        created_version = MagicMock()
-        created_version.storage_location = "abfss://target/.../m1/v1"
-        auth.target_client.registered_models.create.return_value = MagicMock()
-        auth.target_client.model_versions.create.return_value = created_version
-
-        results = apply_model(
-            {
-                "model_fqn": "c.s.m1",
-                "versions": [
-                    {
-                        "version": 1,
-                        "storage_location": "abfss://source/.../m1/v1",
-                        "aliases": [],
-                    }
-                ],
-            },
-            auth=auth,
-            dry_run=False,
-        )
-        assert results[0]["status"] == "failed"
-        assert "artifact copy failed" in results[0]["error_message"]
-        assert "abfss://source/.../m1/v1" in results[0]["error_message"]
-
-    @patch("migrate.models_worker.run_target_file_copy")
-    @patch("migrate.models_worker.ensure_copy_notebook_on_target")
-    @patch("migrate.models_worker.time")
-    def test_copy_notebook_upload_failure_marks_validation_failed(self, mock_time, mock_ensure, mock_copy):
-        """H5: if the helper notebook can't be uploaded the artifact bytes
-        never move — the model is metadata-only on target, which is a
-        real failure mode (not a passing run with a warning). Worker
-        records ``validation_failed`` so the operator sees it and the
-        next migrate retries when the helper is uploadable."""
-        from migrate.models_worker import apply_model
-
-        mock_time.time.side_effect = [100.0, 101.0]
-        mock_ensure.side_effect = Exception("workspace.import_ failed")
-        auth = MagicMock()
-        auth.target_client.registered_models.create.return_value = MagicMock()
-        auth.target_client.model_versions.create.return_value = MagicMock()
-
-        results = apply_model(
-            {
-                "model_fqn": "c.s.m1",
-                "versions": [{"version": 1, "storage_location": "abfss://src/v1"}],
-            },
-            auth=auth,
-            dry_run=False,
-        )
-        assert results[0]["status"] == "validation_failed"
-        assert "artifacts NOT copied" in results[0]["error_message"]
-        mock_copy.assert_not_called()
 
 
 # ---------------------------------------------------- Connections -----
