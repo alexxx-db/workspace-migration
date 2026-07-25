@@ -1,4 +1,14 @@
-"""Unit tests for models_worker — idempotency, error handling, artifact copy."""
+"""Unit tests for models_worker — MLflow-based version creation (#17),
+idempotency, error handling.
+
+Finding #17: the previous implementation called
+``client.model_versions.create(...)`` which does NOT exist on the
+Databricks SDK ``ModelVersionsAPI`` (only delete/get/get_by_alias/
+list/update). UC model versions are created via MLflow. These tests
+exercise the real call path (MLflow client injected via the
+``_registry_client`` seam) — NOT a mock of a fictional SDK method,
+which is what let the original bug ship green.
+"""
 
 from __future__ import annotations
 
@@ -15,130 +25,210 @@ def _model_with_one_version():
         "comment": None,
         "storage_location": None,
         "versions": [
-            {"version": "1", "storage_location": "abfss://src/model/v1", "aliases": []},
+            {
+                "version": "1",
+                "source": "runs:/abc/model",
+                "storage_location": "abfss://src/model/v1",
+                "run_id": "abc",
+                "aliases": [],
+            },
         ],
     }
 
 
-def _auth_with_target():
-    auth = MagicMock()
-    client = auth.target_client
-    fake_version = MagicMock()
-    fake_version.storage_location = "abfss://target/model/v1"
-    client.model_versions.create.return_value = fake_version
-    return auth, client
+def _model_with_three_versions():
+    return {
+        "model_fqn": "c.s.churn",
+        "comment": None,
+        "storage_location": None,
+        "versions": [
+            {
+                "version": "1", "source": "runs:/r1/model",
+                "storage_location": "abfss://src/churn/v1", "run_id": "r1", "aliases": [],
+            },
+            {
+                "version": "2", "source": "runs:/r2/model",
+                "storage_location": "abfss://src/churn/v2", "run_id": "r2", "aliases": [],
+            },
+            {
+                "version": "3", "source": "runs:/r3/model",
+                "storage_location": "abfss://src/churn/v3", "run_id": "r3", "aliases": ["champion"],
+            },
+        ],
+    }
 
 
-def test_apply_model_idempotent_when_model_already_exists(monkeypatch):
-    """If ``registered_models.create`` raises AlreadyExists, the worker
-    continues to versions + aliases rather than failing."""
-    auth, client = _auth_with_target()
-    client.registered_models.create.side_effect = AlreadyExists("model exists")
+def _fake_registry(version_seq=("1",)):
+    """A fake MLflow registry client whose create_model_version returns
+    objects with sequential target version numbers."""
+    reg = MagicMock()
+    created = []
 
-    monkeypatch.setattr(models_worker, "ensure_copy_notebook_on_target", lambda *a, **k: None)
-    monkeypatch.setattr(
-        models_worker,
-        "run_target_file_copy",
-        lambda *a, **k: {"bytes_copied": 0, "file_count": 0},
-    )
+    def _create(name, source, run_id=None, **kwargs):
+        mv = MagicMock()
+        mv.version = version_seq[len(created)] if len(created) < len(version_seq) else str(len(created) + 1)
+        created.append({"name": name, "source": source, "run_id": run_id, "version": mv.version})
+        return mv
+
+    reg.create_model_version.side_effect = _create
+    reg._created = created
+    return reg
+
+
+def _auth():
+    return MagicMock()
+
+
+def test_version_created_via_mlflow_not_sdk(monkeypatch):
+    """The worker creates versions through the MLflow registry client's
+    create_model_version — NOT the (nonexistent) SDK model_versions.create."""
+    auth = _auth()
+    reg = _fake_registry(("1",))
+    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
 
     results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
-    assert len(results) == 1
-    assert results[0]["status"] in ("validated", "validation_failed")
+
+    reg.create_model_version.assert_called_once()
+    _, kwargs = reg.create_model_version.call_args
+    call = reg._created[0]
+    # source resolved to the version's storage_location (reliable cross-workspace)
+    assert call["source"] == "abfss://src/model/v1"
+    assert call["name"] == "c.s.m"
+    assert results[0]["status"] == "validated"
+    # The SDK model_versions API must never be used to CREATE a version.
+    assert not auth.target_client.model_versions.create.called
+
+
+def test_run_id_passed_through(monkeypatch):
+    """Original run_id is preserved when present (provenance)."""
+    auth = _auth()
+    reg = _fake_registry(("1",))
+    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+
+    models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
+    assert reg._created[0]["run_id"] == "abc"
+
+
+def test_source_falls_back_to_source_field_when_no_storage_location(monkeypatch):
+    """If storage_location is empty, fall back to the source URI."""
+    auth = _auth()
+    reg = _fake_registry(("1",))
+    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+
+    model = _model_with_one_version()
+    model["versions"][0]["storage_location"] = None
+    model["versions"][0]["source"] = "abfss://only/source/v1"
+
+    models_worker.apply_model(model, auth=auth, dry_run=False)
+    assert reg._created[0]["source"] == "abfss://only/source/v1"
+
+
+def test_version_with_no_artifact_location_is_skipped_not_crashed(monkeypatch):
+    """Scenario E: a version with neither storage_location nor source can't
+    be registered — recorded validation_failed with a clear message, not a
+    crash, and create_model_version is not called for it."""
+    auth = _auth()
+    reg = _fake_registry(())
+    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+
+    model = _model_with_one_version()
+    model["versions"][0]["storage_location"] = None
+    model["versions"][0]["source"] = None
+
+    results = models_worker.apply_model(model, auth=auth, dry_run=False)
+    reg.create_model_version.assert_not_called()
+    assert results[0]["status"] == "validation_failed"
+    assert "no artifact location" in results[0]["error_message"].lower()
+
+
+def test_unreadable_source_surfaces_uri_and_validation_failed(monkeypatch):
+    """If create_model_version fails (e.g. target can't read source URI),
+    the offending URI is surfaced and the row is validation_failed so a
+    re-run retries after the operator grants access."""
+    auth = _auth()
+    reg = MagicMock()
+    reg.create_model_version.side_effect = PermissionDenied("cannot read abfss://src/model/v1")
+    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+
+    results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
+    assert results[0]["status"] == "validation_failed"
+    assert "abfss://src/model/v1" in results[0]["error_message"]
+
+
+def test_aliases_applied_to_target_version_number(monkeypatch):
+    """MLflow assigns its own target version numbers. Aliases must be set
+    against the RETURNED target version, never the assumed source number."""
+    auth = _auth()
+    # target allocates 10, 11, 12 for source versions 1, 2, 3
+    reg = _fake_registry(("10", "11", "12"))
+    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+
+    results = models_worker.apply_model(_model_with_three_versions(), auth=auth, dry_run=False)
+
+    # champion alias was on source v3 -> must be set on target version 12
+    auth.target_client.registered_models.set_alias.assert_called_once()
+    _, kwargs = auth.target_client.registered_models.set_alias.call_args
+    assert kwargs["alias"] == "champion"
+    assert kwargs["version_num"] == 12
+    assert results[0]["status"] == "validated"
+
+
+def test_model_shell_created_on_target(monkeypatch):
+    """The registered-model shell is still created via the SDK on target."""
+    auth = _auth()
+    reg = _fake_registry(("1",))
+    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+
+    models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
+    auth.target_client.registered_models.create.assert_called_once()
+
+
+def test_model_shell_already_exists_is_idempotent(monkeypatch):
+    """AlreadyExists on the shell create is tolerated (re-run)."""
+    auth = _auth()
+    auth.target_client.registered_models.create.side_effect = AlreadyExists("exists")
+    reg = _fake_registry(("1",))
+    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+
+    results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
     assert results[0]["status"] != "failed"
 
 
-def test_apply_model_propagates_non_already_exists(monkeypatch):
-    """Any error other than AlreadyExists is recorded as ``failed``."""
-    auth, client = _auth_with_target()
-    client.registered_models.create.side_effect = PermissionDenied("nope")
-
-    monkeypatch.setattr(models_worker, "ensure_copy_notebook_on_target", lambda *a, **k: None)
+def test_shell_create_permission_denied_is_failed(monkeypatch):
+    """A non-AlreadyExists shell error is recorded failed."""
+    auth = _auth()
+    auth.target_client.registered_models.create.side_effect = PermissionDenied("nope")
+    reg = _fake_registry(("1",))
+    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
 
     results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
-    assert len(results) == 1
     assert results[0]["status"] == "failed"
     assert "nope" in results[0]["error_message"]
 
 
-def test_apply_model_hard_fails_on_artifact_copy_failure(monkeypatch):
-    """L4: artifact copy failure hard-fails the model row (mirrors volume_worker).
+def test_dry_run_creates_nothing(monkeypatch):
+    """dry_run records skipped and never calls MLflow or the SDK."""
+    auth = _auth()
+    reg = _fake_registry(("1",))
+    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
 
-    Previously the failure was appended to ``version_errors`` and the row
-    was recorded as ``validation_failed``; we now hard-fail because the
-    artifact bytes are essential, not best-effort metadata.
-    """
-    auth, client = _auth_with_target()
-    client.registered_models.create.return_value = None
-
-    monkeypatch.setattr(models_worker, "ensure_copy_notebook_on_target", lambda *a, **k: None)
-
-    def boom(*args, **kwargs):
-        raise RuntimeError("copy job failed")
-
-    monkeypatch.setattr(models_worker, "run_target_file_copy", boom)
-
-    results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
-    assert len(results) == 1
-    assert results[0]["status"] == "failed"
-    assert "copy job failed" in results[0]["error_message"]
-    assert "v1 artifact copy failed" in results[0]["error_message"]
+    results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=True)
+    assert results[0]["status"] == "skipped"
+    reg.create_model_version.assert_not_called()
+    auth.target_client.registered_models.create.assert_not_called()
 
 
-def test_apply_model_version_idempotent_on_already_exists(monkeypatch):
-    """If a version exists, fetch it and proceed to artifact copy."""
-    auth, client = _auth_with_target()
-    client.registered_models.create.return_value = None
-    client.model_versions.create.side_effect = AlreadyExists("version exists")
-    fake_existing = MagicMock()
-    fake_existing.storage_location = "abfss://target/model/v1"
-    client.model_versions.get.return_value = fake_existing
+def test_no_legacy_sdk_model_versions_create_call():
+    """Guard (mirrors #5 SDK-drift guard): the source must never call the
+    nonexistent ``model_versions.create`` — it doesn't exist on the SDK
+    ModelVersionsAPI and reintroducing it reintroduces finding #17."""
+    import pathlib
 
-    monkeypatch.setattr(models_worker, "ensure_copy_notebook_on_target", lambda *a, **k: None)
-    monkeypatch.setattr(
-        models_worker,
-        "run_target_file_copy",
-        lambda *a, **k: {"bytes_copied": 1, "file_count": 1},
+    src = (pathlib.Path(__file__).resolve().parents[2] / "src" / "migrate" / "models_worker.py").read_text()
+    # Ignore comment lines — the fix's rationale mentions the old call by name.
+    code_lines = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+    code = "\n".join(code_lines)
+    assert "model_versions.create" not in code, (
+        "models_worker must not call the nonexistent SDK model_versions.create "
+        "(finding #17) — use MLflow create_model_version via _registry_client."
     )
-
-    results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
-    # Idempotent path should not raise; status reflects whether the artifact
-    # copy succeeded — it does here, so validated.
-    assert results[0]["status"] == "validated"
-    client.model_versions.get.assert_called_once()
-
-
-def test_apply_model_validation_failed_when_helper_unavailable(monkeypatch):
-    """H5: when the target-side copy helper notebook can't be uploaded
-    (``ensure_copy_notebook_on_target`` raises), artifact bytes never
-    move. The row must NOT be ``validated`` — that's a metadata-only
-    target. Mark ``validation_failed`` so the operator sees it and the
-    next migrate retries once the helper is uploadable.
-    """
-    auth, client = _auth_with_target()
-    client.registered_models.create.return_value = None
-
-    def helper_boom(*args, **kwargs):
-        raise RuntimeError("workspace API 403: cannot upload notebook")
-
-    monkeypatch.setattr(models_worker, "ensure_copy_notebook_on_target", helper_boom)
-    # If the helper fails up front, run_target_file_copy is gated off; we
-    # still patch it as a guard so a regression that calls it would fail
-    # the test loudly.
-    monkeypatch.setattr(
-        models_worker,
-        "run_target_file_copy",
-        lambda *a, **k: pytest_fail("run_target_file_copy must not be called when helper unavailable"),
-    )
-
-    results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
-    assert len(results) == 1
-    assert results[0]["status"] == "validation_failed"
-    err = results[0]["error_message"]
-    # The 0/0 copy summary and the helper-unavailable note must both be visible.
-    assert "0 file(s), 0 byte(s) copied." in err
-    assert "Artifact copy helper unavailable on target" in err
-
-
-def pytest_fail(msg: str):  # pragma: no cover - guard helper
-    raise AssertionError(msg)

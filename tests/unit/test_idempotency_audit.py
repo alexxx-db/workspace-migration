@@ -861,57 +861,74 @@ class TestSharingIdempotency:
 # ============================================================================
 # models_worker
 # ============================================================================
-# | any | model missing | registered_models.create + versions + aliases    | validated |
-# | any | model exists  | registered_models.create raises "already exists" | swallow + continue to versions |
-# | any | version exists| model_versions.create raises "already exists"    | swallow + continue to aliases |
-# | any | any           | registered_models.set_alias                      | server-side replace, idempotent |
+# | any | model missing | registered_models.create + MLflow versions + aliases | validated |
+# | any | model exists  | registered_models.create raises "already exists"      | swallow + continue to versions |
+# | any | version exists| MLflow create_model_version raises "already exists"   | note + continue (validation_failed) |
+# | any | any           | registered_models.set_alias                           | server-side replace, idempotent |
 
 
-@patch("migrate.models_worker.run_target_file_copy", return_value={"bytes_copied": 0, "file_count": 0})
-@patch("migrate.models_worker.ensure_copy_notebook_on_target")
+def _mlflow_registry(target_versions=("1",)):
+    """Fake MLflow registry client (the _registry_client seam) whose
+    create_model_version returns sequential target version numbers."""
+    reg = MagicMock()
+    created = []
+
+    def _create(name, source, run_id=None, **kwargs):
+        mv = MagicMock()
+        mv.version = target_versions[len(created)] if len(created) < len(target_versions) else str(len(created) + 1)
+        created.append(name)
+        return mv
+
+    reg.create_model_version.side_effect = _create
+    return reg
+
+
 class TestModelsIdempotency:
-    def test_model_already_exists_continues_to_versions(self, _ensure, _copy):
-        """Pin: registered_models.create AlreadyExists does not fail the model."""
+    def test_model_already_exists_continues_to_versions(self, monkeypatch):
+        """Pin: registered_models.create AlreadyExists does not fail the model;
+        the version is still created via MLflow."""
         from databricks.sdk.errors import AlreadyExists
 
         from migrate.models_worker import apply_model
 
+        reg = _mlflow_registry(("1",))
+        monkeypatch.setattr("migrate.models_worker._registry_client", lambda a: reg)
         auth = MagicMock()
         auth.target_client.registered_models.create.side_effect = AlreadyExists(
             "model 'm' already exists"
         )
-        auth.target_client.model_versions.create.return_value = None
-        auth.target_client.registered_models.set_alias.return_value = None
         results = apply_model(
             {"model_fqn": "c.s.m", "versions": [
-                {"version": "1", "source": "dbfs:/v1", "aliases": ["prod"]},
+                {"version": "1", "source": "dbfs:/v1", "storage_location": "abfss://src/v1", "aliases": ["prod"]},
             ]},
             auth=auth, dry_run=False,
         )
         assert results[0]["status"] == "validated"
-        # Version create was still attempted.
-        auth.target_client.model_versions.create.assert_called_once()
+        # Version create was still attempted via MLflow.
+        reg.create_model_version.assert_called_once()
 
-    def test_version_already_exists_continues_to_aliases(self, _ensure, _copy):
-        """Pin: model_versions.create AlreadyExists does not fail the model."""
+    def test_version_already_exists_is_noted_not_crashed(self, monkeypatch):
+        """Pin: MLflow create_model_version AlreadyExists (re-run without a
+        reconciliation drop) is noted, not a crash. Reconciliation normally
+        drops the whole model first, so this is the belt-and-braces path."""
         from databricks.sdk.errors import AlreadyExists
 
         from migrate.models_worker import apply_model
 
+        reg = MagicMock()
+        reg.create_model_version.side_effect = AlreadyExists("version 1 already exists")
+        monkeypatch.setattr("migrate.models_worker._registry_client", lambda a: reg)
         auth = MagicMock()
         auth.target_client.registered_models.create.return_value = None
-        auth.target_client.model_versions.create.side_effect = AlreadyExists(
-            "version 1 already exists"
-        )
-        auth.target_client.registered_models.set_alias.return_value = None
         results = apply_model(
             {"model_fqn": "c.s.m", "versions": [
-                {"version": "1", "source": "dbfs:/v1", "aliases": ["prod"]},
+                {"version": "1", "source": "dbfs:/v1", "storage_location": "abfss://src/v1", "aliases": ["prod"]},
             ]},
             auth=auth, dry_run=False,
         )
-        assert results[0]["status"] == "validated"
-        auth.target_client.registered_models.set_alias.assert_called_once()
+        # Not a crash; recorded as validation_failed with the already-exists note.
+        assert results[0]["status"] == "validation_failed"
+        assert "already exists" in results[0]["error_message"]
 
 
 # ============================================================================

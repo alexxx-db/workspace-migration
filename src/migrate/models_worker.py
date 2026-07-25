@@ -18,17 +18,36 @@ except NameError:
 # COMMAND ----------
 # Registered Models Worker (Phase 3 Task 34).
 #
-# Three-phase: (a) create model shell via SDK, (b) create each version
-# with ``source`` pointing at the source-side artifact URI and copy the
-# artifact bytes across to the target's newly allocated version path
-# (falls back to a ``validation_failed`` status if the target SPN can't
-# read the source URI), (c) replay aliases per version.
+# Two-phase per model:
+#   (a) create the registered-model shell on target via the SDK
+#       (``registered_models.create``), and
+#   (b) for each source version, create the target version via MLflow's
+#       ``create_model_version(name, source, run_id)`` and let Unity
+#       Catalog ingest the artifacts from ``source`` into target-managed
+#       storage — then apply that version's aliases against the TARGET
+#       version number MLflow allocates.
 #
-# Artifact copy requires the target SPN to have read access to the
-# source workspace's model storage URI — typically ``abfss://`` /
-# ``s3://`` — either via shared storage credentials or a cross-account
-# IAM role. When inaccessible, the error_message surfaces the offending
-# URI so operators know what to grant.
+# Why MLflow and not the SDK (finding #17): UC model versions are created
+# through MLflow, not ``databricks.sdk``. ``ModelVersionsAPI`` has no
+# ``create`` method (only delete/get/get_by_alias/list/update), so the
+# previous ``client.model_versions.create(...)`` raised AttributeError on
+# every version — the model migrated as an empty shell. MLflow's
+# create_model_version both allocates the version AND copies the artifacts,
+# so there is no separate byte-copy step.
+#
+# Execution model: the worker runs on the SOURCE workspace's compute (it
+# reads the source artifacts locally/natively) but the MLflow registry
+# client is pointed at the TARGET workspace's Unity Catalog registry
+# (``_registry_client``) — so the version lands on the target, mirroring
+# how ``auth.target_client`` targets the target for the SDK shell create.
+#
+# ``source`` requirement: the target UC must be able to read the artifact
+# location handed to create_model_version. We prefer the version's
+# ``storage_location`` (the concrete UC-managed artifact dir, which
+# resolves reliably cross-workspace) and fall back to the original
+# ``source`` URI. When neither is readable the create fails; we surface
+# the offending URI and mark the row ``validation_failed`` so a re-run
+# retries after the operator grants access.
 
 import json
 import logging
@@ -40,7 +59,6 @@ from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
 from migrate.reconciliation import resolve_current_job_run_id
-from migrate.target_copy import ensure_copy_notebook_on_target, run_target_file_copy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("models_worker")
@@ -59,6 +77,25 @@ def _parse_fqn(fqn: str) -> tuple[str, str, str]:
     if len(parts) != 3:
         raise ValueError(f"Malformed model FQN: {fqn}")
     return parts[0], parts[1], parts[2]
+
+
+def _registry_client(auth: AuthManager):
+    """Return an MLflow registry client pointed at the TARGET workspace's
+    Unity Catalog model registry.
+
+    The worker runs on source-workspace compute; aiming the MLflow client
+    at the target registry is what makes ``create_model_version`` land the
+    new version on the target (the MLflow analogue of
+    ``auth.target_client``). ``mlflow`` is only present on the Databricks
+    runtime, so it is imported lazily here — unit tests replace this whole
+    function via the module seam and never import mlflow.
+    """
+    from mlflow.tracking import MlflowClient
+
+    host = auth.config.target_workspace_url
+    token = auth.target_client.config.token
+    tracking_uri = f"databricks://{host}:{token}" if token else "databricks"
+    return MlflowClient(tracking_uri=tracking_uri, registry_uri="databricks-uc")
 
 
 def apply_model(
@@ -124,115 +161,70 @@ def apply_model(
         )
         return results
 
-    # Ensure the target-side copy helper notebook is uploaded once up front
-    # so repeated per-version copy calls don't each re-upload it.
-    artifact_copy_available = True
-    try:
-        ensure_copy_notebook_on_target(auth)
-    except Exception as exc:  # noqa: BLE001
-        artifact_copy_available = False
-        logger.warning(
-            "Could not upload target copy notebook; model artifacts will not "
-            "be copied for %s: %s",
-            model_fqn,
-            exc,
-            exc_info=True,
-        )
+    # MLflow registry client aimed at the target workspace's UC registry.
+    # create_model_version both allocates the version and ingests the
+    # artifacts from ``source`` — no separate byte-copy step (finding #17).
+    full_name = f"{catalog}.{schema}.{name}"
+    registry = _registry_client(auth)
 
-    # 2. Versions — create metadata, then copy artifacts per version
+    # 2. Versions — create on target via MLflow. MLflow allocates its OWN
+    # target version numbers, so aliases are applied against the RETURNED
+    # version, never the source number.
     version_errors: list[str] = []
-    total_bytes = 0
-    total_files = 0
+    versions_created = 0
     for v in model.get("versions", []):
-        version_num = v.get("version", "?")
-        source_uri = v.get("storage_location") or v.get("source") or ""
-        created_version = None
-        try:
-            created_version = client.model_versions.create(
-                catalog_name=catalog,
-                schema_name=schema,
-                model_name=name,
-                source=source_uri,
-                run_id=None,
+        source_version = v.get("version", "?")
+        # Prefer the concrete UC-managed artifact dir (resolves reliably
+        # cross-workspace); fall back to the original registration URI.
+        artifact_source = v.get("storage_location") or v.get("source") or ""
+        if not artifact_source:
+            # Scenario E: nothing to register from (external/GC'd artifacts).
+            version_errors.append(
+                f"v{source_version}: no artifact location (storage_location/source both empty); "
+                "register manually"
             )
-        except AlreadyExists:
-            # IDEMPOTENT: version exists — fetch it so artifacts can retry.
-            try:
-                created_version = client.model_versions.get(
-                    full_name=f"{catalog}.{schema}.{name}",
-                    version=int(version_num),
-                )
-            except Exception:  # noqa: BLE001
-                created_version = None
+            continue
+
+        try:
+            created = registry.create_model_version(
+                name=full_name,
+                source=artifact_source,
+                run_id=v.get("run_id"),
+            )
+            versions_created += 1
+        except AlreadyExists as exc:  # noqa: BLE001
+            # Re-run without a preceding reconciliation drop — treat as done
+            # but note it (reconciliation normally drops the whole model).
+            version_errors.append(f"v{source_version}: already exists ({exc})")
+            continue
         except Exception as exc:  # noqa: BLE001
-            version_errors.append(f"v{version_num}: {exc}")
-            try:
-                created_version = client.model_versions.get(
-                    full_name=f"{catalog}.{schema}.{name}",
-                    version=int(version_num),
-                )
-            except Exception:  # noqa: BLE001
-                created_version = None
+            # Most commonly the target UC can't read ``artifact_source``.
+            # Surface the offending URI so the operator knows what to grant.
+            version_errors.append(
+                f"v{source_version}: create_model_version failed (source={artifact_source}): {exc}"
+            )
+            continue
 
-        # Copy artifact files from source's storage_location to target's
-        # allocated storage_location. Skip silently when the source URI is
-        # empty, the version create/fetch failed, or the copy notebook
-        # couldn't be uploaded — operators see the fallback in error_message.
-        # Mirrors volume_worker: artifact bytes are essential, so a copy
-        # failure hard-fails the model migration row.
-        target_loc = getattr(created_version, "storage_location", None) if created_version else None
-        if artifact_copy_available and source_uri and target_loc:
-            try:
-                res = run_target_file_copy(
-                    auth,
-                    src_path=source_uri,
-                    dst_path=target_loc,
-                    run_name=f"model_artifact_copy__{model_fqn}__v{version_num}",
-                )
-                total_bytes += int(res.get("bytes_copied", 0))
-                total_files += int(res.get("file_count", 0))
-            except Exception as exc:  # noqa: BLE001
-                duration = time.time() - start
-                results.append(
-                    {
-                        "object_name": obj_key,
-                        "object_type": "registered_model",
-                        "status": "failed",
-                        "error_message": (
-                            f"v{version_num} artifact copy failed "
-                            f"(src={source_uri}): {exc}"
-                        ),
-                        "duration_seconds": duration,
-                    }
-                )
-                return results
-
-        # 3. Aliases for this version
+        # 3. Aliases — set against the TARGET version MLflow just allocated.
+        target_version = int(created.version)
         for alias in v.get("aliases") or []:
             try:
                 client.registered_models.set_alias(
-                    full_name=f"{catalog}.{schema}.{name}",
+                    full_name=full_name,
                     alias=alias,
-                    version_num=int(version_num),
+                    version_num=target_version,
                 )
             except Exception as exc:  # noqa: BLE001
-                version_errors.append(f"alias '{alias}' v{version_num}: {exc}")
+                version_errors.append(f"alias '{alias}' (src v{source_version}): {exc}")
 
     duration = time.time() - start
-    status_msg_parts: list[str] = [f"{total_files} file(s), {total_bytes} byte(s) copied."]
-    if not artifact_copy_available:
-        status_msg_parts.append(
-            "Artifact copy helper unavailable on target — artifacts NOT copied."
-        )
+    status_msg_parts: list[str] = [f"{versions_created} version(s) created."]
     if version_errors:
         status_msg_parts.append("Errors: " + "; ".join(version_errors[:5]))
-    # H5: missing artifact copy is a real failure mode, not a passing run
-    # with a warning. Without artifacts, the registered model is metadata-
-    # only on target — operator intervention is required. Mark
-    # validation_failed (non-terminal) so the next migrate run retries
-    # once the helper notebook is uploadable, matching the volume worker
-    # contract (artifact bytes are essential).
-    _is_failed = bool(version_errors) or not artifact_copy_available
+    # A version that failed to create/ingest leaves the model incomplete on
+    # target — operator intervention required. Mark validation_failed
+    # (non-terminal) so the next migrate run retries once access is granted.
+    _is_failed = bool(version_errors)
     results.append(
         {
             "object_name": obj_key,
