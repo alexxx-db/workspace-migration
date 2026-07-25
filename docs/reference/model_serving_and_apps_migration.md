@@ -38,9 +38,11 @@ the registered model + schema + catalog in as dependencies.
   `entity_version`.
 
 ### Working process
-1. **Migrate the model with this tool** — `models_worker` recreates the registered model,
-   its versions, **and copies the artifact bytes** to the target (sets aliases). This is
-   what makes the served version exist + `READY` on the target.
+1. **Migrate the model with this tool** — `models_worker` recreates the registered model
+   and each version by **downloading the source version's artifacts (MLflow) and
+   re-registering them on the target** (MLflow ingests them into target-managed storage),
+   then sets aliases. This is what makes the served version exist + `READY` on the target.
+   Requires `mlflow` on the serverless runtime.
 2. **Export the endpoint** from the source with `-listing=model-serving` — **only when the
    endpoint is `READY`.** ⚠️ A `NOT_READY` (provisioning) endpoint exports as a *name-only
    stub*; wait for `READY` to get the full config.
