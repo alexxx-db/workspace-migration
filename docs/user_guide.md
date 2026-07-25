@@ -240,7 +240,7 @@ models):
 | Tags, ABAC policies | `tags_worker`, `policies_worker` |
 | Row filters, column masks | `row_filters_worker`, `column_masks_worker` (DDL replay; see RLS/CM note in README) |
 | Comments, table properties | preserved by `DEEP CLONE` for Delta; DDL replay otherwise |
-| Registered models | `models_worker` — metadata + versions + **artifact-byte copy** + aliases |
+| Registered models | `models_worker` — shell + each version (MLflow **download from source → re-register on target**, which ingests the artifacts into target-managed storage) + aliases. Requires `mlflow` on the serverless runtime. |
 | Connections, foreign catalogs | `connections_worker`, `foreign_catalogs_worker` (connection secrets are **not** exported — re-enter) |
 | Customer shares, recipients, providers | `sharing_worker` (SPN must own or hold `USE SHARE`/`USE RECIPIENT` — see README) |
 | Lakehouse monitors | `monitors_worker` (metric history does not transfer) |
@@ -317,6 +317,11 @@ Section 8:
 - **Delta Sharing enabled** on both metastores.
 - **Target storage credentials + external locations** created for any external
   table / DBFS-root path the migration touches.
+- **`mlflow` on the serverless job runtime** if you migrate registered models —
+  both discovery (alias enumeration) and `models_worker` (download-then-register)
+  use it. The serverless default env includes it; if a run reports
+  `ModuleNotFoundError: mlflow`, add `%pip install mlflow` or pin it in the job's
+  environment spec.
 
 ### Policy-protected tables are excluded (RLS / column mask / ABAC)
 Tables protected by a **row filter**, **column mask**, or an **ABAC policy**

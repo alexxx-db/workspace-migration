@@ -522,6 +522,10 @@ class TestModelsWorker:
         mock_time.time.side_effect = [100.0, 110.0]
         reg = self._fake_registry(("1",))
         monkeypatch.setattr("migrate.models_worker._registry_client", lambda a: reg)
+        monkeypatch.setattr(
+            "migrate.models_worker._download_source_artifacts",
+            lambda auth, fqn, ver: f"/local/dl/{fqn}/{ver}",
+        )
         auth = MagicMock()
         auth.target_client.registered_models.create.return_value = MagicMock()
 
@@ -545,11 +549,11 @@ class TestModelsWorker:
         assert len(results) == 1
         assert results[0]["status"] == "validated"
         assert "1 version(s) created" in results[0]["error_message"]
-        # Version created via MLflow from the storage_location.
+        # Version created via MLflow from the LOCAL downloaded path (Option-2).
         reg.create_model_version.assert_called_once()
         _, kwargs = reg.create_model_version.call_args
         assert kwargs["name"] == "c.s.m1"
-        assert kwargs["source"] == "abfss://source/.../m1/v1"
+        assert kwargs["source"] == "/local/dl/c.s.m1/1"
         auth.target_client.registered_models.set_alias.assert_called_once_with(
             full_name="c.s.m1",
             alias="prod",

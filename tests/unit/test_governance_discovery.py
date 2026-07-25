@@ -285,9 +285,7 @@ class TestListMonitors:
 
 
 class TestListRegisteredModels:
-    def test_captures_versions_and_aliases(self):
-        auth = MagicMock()
-
+    def _model_and_version(self, auth):
         model = MagicMock()
         model.full_name = "c.s.model_a"
         model.owner = "alice"
@@ -300,18 +298,43 @@ class TestListRegisteredModels:
         v1.source = "run:/abc/artifact"
         v1.storage_location = "abfss://.../v1"
         v1.status = "READY"
-        alias = MagicMock()
-        alias.alias_name = "prod"
-        v1.aliases = [alias]
-
+        # Real SDK 0.49.0 behaviour: the version-level .aliases field is
+        # EMPTY even when an alias exists (finding #23). Aliases must be
+        # sourced from the MLflow model-level alias map, not v.aliases.
+        v1.aliases = []
         auth.source_client.model_versions.list.return_value = [v1]
+        return model, v1
+
+    def test_captures_versions_and_aliases_from_mlflow_map(self, monkeypatch):
+        """Aliases come from the model-level MLflow alias map (finding #23),
+        keyed onto the matching version — NOT from the empty v.aliases."""
+        from common.catalog_utils import CatalogExplorer
+
+        auth = MagicMock()
+        self._model_and_version(auth)
+        # MLflow reports champion -> version 1 (the enumeration that works).
+        monkeypatch.setattr(
+            CatalogExplorer, "_model_aliases", lambda self, fqn: {"champion": "1"}
+        )
         explorer = _explorer(MagicMock(), auth)
 
         models = explorer.list_registered_models("c", "s")
         assert len(models) == 1
         assert models[0]["model_fqn"] == "c.s.model_a"
         assert models[0]["versions"][0]["version"] == 1
-        assert models[0]["versions"][0]["aliases"] == ["prod"]
+        assert models[0]["versions"][0]["aliases"] == ["champion"]
+
+    def test_no_aliases_when_map_empty(self, monkeypatch):
+        """No aliases → empty list, not a crash."""
+        from common.catalog_utils import CatalogExplorer
+
+        auth = MagicMock()
+        self._model_and_version(auth)
+        monkeypatch.setattr(CatalogExplorer, "_model_aliases", lambda self, fqn: {})
+        explorer = _explorer(MagicMock(), auth)
+
+        models = explorer.list_registered_models("c", "s")
+        assert models[0]["versions"][0]["aliases"] == []
 
 
 class TestListConnections:

@@ -893,6 +893,10 @@ class TestModelsIdempotency:
 
         reg = _mlflow_registry(("1",))
         monkeypatch.setattr("migrate.models_worker._registry_client", lambda a: reg)
+        monkeypatch.setattr(
+            "migrate.models_worker._download_source_artifacts",
+            lambda auth, fqn, ver: f"/local/dl/{fqn}/{ver}",
+        )
         auth = MagicMock()
         auth.target_client.registered_models.create.side_effect = AlreadyExists(
             "model 'm' already exists"
@@ -918,6 +922,10 @@ class TestModelsIdempotency:
         reg = MagicMock()
         reg.create_model_version.side_effect = AlreadyExists("version 1 already exists")
         monkeypatch.setattr("migrate.models_worker._registry_client", lambda a: reg)
+        monkeypatch.setattr(
+            "migrate.models_worker._download_source_artifacts",
+            lambda auth, fqn, ver: f"/local/dl/{fqn}/{ver}",
+        )
         auth = MagicMock()
         auth.target_client.registered_models.create.return_value = None
         results = apply_model(

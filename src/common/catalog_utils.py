@@ -668,12 +668,30 @@ class CatalogExplorer:
                 continue  # no monitor (404) or transient error
         return results
 
+    def _model_aliases(self, model_fqn: str) -> dict[str, str]:
+        """Return a model's alias map ``{alias_name: version}`` via MLflow.
+
+        Finding #23: on the runtime SDK (0.49.0) the version-level and
+        model-level ``.aliases`` fields read EMPTY even when an alias exists
+        — only MLflow's model-level alias map is reliable (verified live:
+        ``registered_models.get().aliases`` == [] but
+        ``MlflowClient().get_registered_model(fqn).aliases`` ==
+        ``{"champion": "1"}``). ``mlflow`` is runtime-only, imported lazily;
+        unit tests replace this method via the class seam.
+        """
+        from mlflow.tracking import MlflowClient
+
+        rm = MlflowClient(registry_uri="databricks-uc").get_registered_model(model_fqn)
+        return {name: str(ver) for name, ver in (getattr(rm, "aliases", {}) or {}).items()}
+
     def list_registered_models(self, catalog: str, schema: str) -> list[dict]:
         """Registered models in a schema via SDK ``registered_models.list``.
 
         Returns one record per model with its versions inline — artifact
         copy happens in the models worker, this helper just captures the
-        metadata.
+        metadata. Aliases are sourced from the MLflow model-level alias map
+        (``_model_aliases``) and keyed onto their version, because the SDK
+        ``.aliases`` fields read empty on the runtime (finding #23).
         """
         results: list[dict] = []
         try:
@@ -682,15 +700,21 @@ class CatalogExplorer:
                 versions = []
                 if m.full_name is None:
                     continue
+                # alias map {alias_name: version} for this model (finding #23).
+                alias_map: dict[str, str] = {}
+                with _suppress():
+                    alias_map = self._model_aliases(m.full_name)
                 with _suppress():
                     for v in client.model_versions.list(full_name=m.full_name):
+                        _ver = str(v.version)
+                        _aliases = [a for a, av in alias_map.items() if str(av) == _ver]
                         versions.append(
                             {
                                 "version": v.version,
                                 "source": v.source,
                                 "storage_location": getattr(v, "storage_location", None),
                                 "status": str(getattr(v, "status", "")),
-                                "aliases": [a.alias_name for a in (v.aliases or [])],
+                                "aliases": _aliases,
                             }
                         )
                 results.append(

@@ -364,6 +364,32 @@ dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
     key="has_rls_cm_managed", value="true" if _has_rls_cm_managed else "false"
 )
 
+# --- #19 cascade-skip fixture: view over a not-migrated (policy-protected)
+# table ---
+# managed_sensitive carries RLS+CM, so the #16 fix de-scopes it
+# (status=skipped_policy_protected → not migrated). A view that reads it
+# must therefore cascade-skip (status=skipped_dependency_not_migrated),
+# NOT hard-fail TABLE_OR_VIEW_NOT_FOUND (finding #19).
+_has_dependent_view_on_protected = False
+if _has_rls_cm_managed:
+    try:
+        spark.sql(  # noqa: F821
+            """
+            CREATE OR REPLACE VIEW integration_test_src.test_schema.sensitive_summary AS
+            SELECT region, COUNT(*) AS n
+            FROM integration_test_src.test_schema.managed_sensitive
+            GROUP BY region
+            """
+        )
+        _has_dependent_view_on_protected = True
+        print("Created sensitive_summary view over policy-protected managed_sensitive (#19 fixture).")
+    except Exception as _exc:  # noqa: BLE001
+        print(f"Skipped #19 dependent-view seed: {_exc}")
+dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
+    key="has_dependent_view_on_protected",
+    value="true" if _has_dependent_view_on_protected else "false",
+)
+
 # COMMAND ----------
 
 # Task 32 — Comments on catalog/schema/table
@@ -641,31 +667,34 @@ _MODEL_CATALOG = "integration_test_src"
 _MODEL_SCHEMA = "test_schema"
 _MODEL_NAME = "integration_test_model"
 _MODEL_ALIAS = "champion"
+_MODEL_VERSION_NUM = "1"
 try:
     # Idempotent: delete any pre-existing model so the seed is deterministic.
     with contextlib.suppress(Exception):
         _w_seed.registered_models.delete(f"{_MODEL_CATALOG}.{_MODEL_SCHEMA}.{_MODEL_NAME}")
-    _w_seed.registered_models.create(
-        catalog_name=_MODEL_CATALOG,
-        schema_name=_MODEL_SCHEMA,
-        name=_MODEL_NAME,
-        comment="Integration test fixture — scoped metadata only, no artifacts",
-    )
-    # Create version with empty source (metadata only; artifact copy path
-    # is 3.20, out of scope for this item).
-    _created_version = _w_seed.model_versions.create(
-        catalog_name=_MODEL_CATALOG,
-        schema_name=_MODEL_SCHEMA,
-        model_name=_MODEL_NAME,
-        source="",  # intentionally empty — no artifact bytes to copy
-    )
-    _w_seed.registered_models.set_alias(
-        full_name=f"{_MODEL_CATALOG}.{_MODEL_SCHEMA}.{_MODEL_NAME}",
-        alias=_MODEL_ALIAS,
-        version_num=int(_created_version.version),
+
+    # Create the model version via MLflow, NOT the SDK. The Databricks SDK
+    # ``model_versions.create`` does NOT exist (finding #17) — UC model
+    # versions are created through MLflow, which also ingests the artifacts
+    # from ``source`` into UC-managed storage. Log a tiny artifact in a run,
+    # then register it so the version has real bytes the migration can copy.
+    import mlflow  # noqa: E402
+    from mlflow.tracking import MlflowClient  # noqa: E402
+
+    mlflow.set_registry_uri("databricks-uc")
+    _full_name = f"{_MODEL_CATALOG}.{_MODEL_SCHEMA}.{_MODEL_NAME}"
+    with mlflow.start_run() as _run:
+        with open("/tmp/seed_model_reqs.txt", "w") as _f:
+            _f.write("# integration-test model artifact\nscikit-learn==1.4.0\n")
+        mlflow.log_artifact("/tmp/seed_model_reqs.txt", artifact_path="model")
+        _run_id = _run.info.run_id
+    _mv = mlflow.register_model(f"runs:/{_run_id}/model", _full_name)
+    _MODEL_VERSION_NUM = str(_mv.version)
+    MlflowClient().set_registered_model_alias(
+        name=_full_name, alias=_MODEL_ALIAS, version=int(_MODEL_VERSION_NUM)
     )
     _has_registered_model = True
-    print(f"Created registered model {_MODEL_NAME} v{_created_version.version} with alias '{_MODEL_ALIAS}'.")
+    print(f"Created registered model {_MODEL_NAME} v{_MODEL_VERSION_NUM} with alias '{_MODEL_ALIAS}' (MLflow).")
 except Exception as _exc:  # noqa: BLE001
     print(f"Skipped registered model seed: {_exc}")
 dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
@@ -934,66 +963,21 @@ dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
 # without UC model support, or one where the registered_models API
 # rejects ``storage_location`` overrides, doesn't fail the integration.
 
-_has_model_artifacts = False
+# The 3.19 seed above (MLflow register_model) already created the model
+# version WITH real artifacts logged in the run — MLflow ingested them
+# into the version's UC-managed storage_location. So "has artifacts" is
+# simply whether that seed succeeded; no separate SDK-based seed needed
+# (and the SDK model_versions.create it used doesn't exist — finding #17).
+_has_model_artifacts = _has_registered_model
 _model_fqn = "integration_test_src.test_schema.integration_test_model"
-_model_artifact_bytes = b"# integration-test requirements.txt\nrequests==2.31.0\n"
-try:
-    from databricks.sdk import WorkspaceClient as _WorkspaceClient  # noqa: E402
-
-    _wsc = _WorkspaceClient()
-    # Shell model
-    try:
-        _wsc.registered_models.create(
-            catalog_name="integration_test_src",
-            schema_name="test_schema",
-            name="integration_test_model",
-            comment="Phase 3 integration test model",
-        )
-    except Exception as _exc:  # noqa: BLE001
-        if "already" not in str(_exc).lower() or "exists" not in str(_exc).lower():
-            raise
-    # One version — the source URI must be readable by the target SPN.
-    # We create the version FIRST with a placeholder source so UC
-    # allocates ``storage_location`` on the source side, seed the
-    # artifact bytes there via ``dbutils.fs.put``, then (for clarity
-    # in the downstream assertion) capture the actual storage_location
-    # and re-publish it as the version's source.
-    _created = _wsc.model_versions.create(
-        catalog_name="integration_test_src",
-        schema_name="test_schema",
-        model_name="integration_test_model",
-        source="dbfs:/tmp/integration_test_model_placeholder",
-    )
-    _version_storage = getattr(_created, "storage_location", None) or ""
-    if not _version_storage:
-        raise RuntimeError(
-            "UC did not return storage_location for the new model version — "
-            "cannot stage an artifact the target SPN can read."
-        )
-    # Seed the artifact file.
-    dbutils.fs.put(  # type: ignore[name-defined]  # noqa: F821
-        _version_storage.rstrip("/") + "/requirements.txt",
-        _model_artifact_bytes.decode(),
-        overwrite=True,
-    )
-    # Re-read the version so we have the authoritative source URL for
-    # models_worker to copy from. In the `source` field, point at the
-    # same storage_location — models_worker prefers ``storage_location``
-    # over ``source`` anyway, so either works.
-    _has_model_artifacts = True
-    print(
-        f"Seeded model artifact ({len(_model_artifact_bytes)} bytes) at "
-        f"{_version_storage}/requirements.txt."
-    )
-except Exception as _exc:  # noqa: BLE001
-    print(f"Skipped model artifact seed: {_exc}")
+if _has_model_artifacts:
+    print(f"Model {_model_fqn} v{_MODEL_VERSION_NUM} has artifacts (seeded via MLflow run).")
+else:
+    print("No model artifacts (3.19 model seed did not succeed).")
 
 dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
     key="has_model_artifacts",
     value="true" if _has_model_artifacts else "false",
-)
-dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
-    key="model_artifact_bytes", value=str(len(_model_artifact_bytes))
 )
 dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
     key="model_fqn", value=_model_fqn

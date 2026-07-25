@@ -4,10 +4,17 @@ idempotency, error handling.
 Finding #17: the previous implementation called
 ``client.model_versions.create(...)`` which does NOT exist on the
 Databricks SDK ``ModelVersionsAPI`` (only delete/get/get_by_alias/
-list/update). UC model versions are created via MLflow. These tests
-exercise the real call path (MLflow client injected via the
-``_registry_client`` seam) — NOT a mock of a fictional SDK method,
-which is what let the original bug ship green.
+list/update). UC model versions are created via MLflow.
+
+Option-2 (stage-then-register): a direct ``create_model_version`` from
+the source's ``abfss://unity-catalog@…`` storage FAILS cross-metastore
+(the target-pointed MLflow client falls back to DefaultAzureCredential,
+which has no creds on serverless — proven live 2026-07-25). So the
+worker first DOWNLOADS the source version's artifacts to local disk via
+the SOURCE registry (UC-vended creds), then registers on the target from
+that local path. Two seams the tests inject: ``_download_source_artifacts``
+(source-side download → local path) and ``_registry_client`` (target
+registry). Neither imports mlflow in the unit tests.
 """
 
 from __future__ import annotations
@@ -79,20 +86,37 @@ def _auth():
     return MagicMock()
 
 
-def test_version_created_via_mlflow_not_sdk(monkeypatch):
-    """The worker creates versions through the MLflow registry client's
-    create_model_version — NOT the (nonexistent) SDK model_versions.create."""
+def _fake_downloader(paths=None):
+    """Fake source-side downloader: records (model_fqn, version) and returns
+    a deterministic local path per call."""
+    calls = []
+
+    def _dl(auth, model_fqn, version):
+        calls.append({"model_fqn": model_fqn, "version": str(version)})
+        return f"/local_disk0/dl/{model_fqn}/{version}"
+
+    _dl.calls = calls
+    return _dl
+
+
+def test_version_registered_from_local_download_not_source_uri(monkeypatch):
+    """Option-2: the worker DOWNLOADS the source version's artifacts to a
+    local path, then registers on target from that LOCAL path — not from
+    the source's abfss:// URI (which fails cross-metastore)."""
     auth = _auth()
     reg = _fake_registry(("1",))
+    dl = _fake_downloader()
     monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+    monkeypatch.setattr(models_worker, "_download_source_artifacts", dl)
 
     results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
 
+    # Downloaded from the source model + version.
+    assert dl.calls == [{"model_fqn": "c.s.m", "version": "1"}]
     reg.create_model_version.assert_called_once()
-    _, kwargs = reg.create_model_version.call_args
     call = reg._created[0]
-    # source resolved to the version's storage_location (reliable cross-workspace)
-    assert call["source"] == "abfss://src/model/v1"
+    # source is the LOCAL download path, NOT the abfss:// URI.
+    assert call["source"] == "/local_disk0/dl/c.s.m/1"
     assert call["name"] == "c.s.m"
     assert results[0]["status"] == "validated"
     # The SDK model_versions API must never be used to CREATE a version.
@@ -104,32 +128,21 @@ def test_run_id_passed_through(monkeypatch):
     auth = _auth()
     reg = _fake_registry(("1",))
     monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+    monkeypatch.setattr(models_worker, "_download_source_artifacts", _fake_downloader())
 
     models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
     assert reg._created[0]["run_id"] == "abc"
 
 
-def test_source_falls_back_to_source_field_when_no_storage_location(monkeypatch):
-    """If storage_location is empty, fall back to the source URI."""
-    auth = _auth()
-    reg = _fake_registry(("1",))
-    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
-
-    model = _model_with_one_version()
-    model["versions"][0]["storage_location"] = None
-    model["versions"][0]["source"] = "abfss://only/source/v1"
-
-    models_worker.apply_model(model, auth=auth, dry_run=False)
-    assert reg._created[0]["source"] == "abfss://only/source/v1"
-
-
 def test_version_with_no_artifact_location_is_skipped_not_crashed(monkeypatch):
     """Scenario E: a version with neither storage_location nor source can't
-    be registered — recorded validation_failed with a clear message, not a
-    crash, and create_model_version is not called for it."""
+    be downloaded/registered — recorded validation_failed with a clear
+    message, not a crash; download + create are not called for it."""
     auth = _auth()
     reg = _fake_registry(())
+    dl = _fake_downloader()
     monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+    monkeypatch.setattr(models_worker, "_download_source_artifacts", dl)
 
     model = _model_with_one_version()
     model["versions"][0]["storage_location"] = None
@@ -137,22 +150,42 @@ def test_version_with_no_artifact_location_is_skipped_not_crashed(monkeypatch):
 
     results = models_worker.apply_model(model, auth=auth, dry_run=False)
     reg.create_model_version.assert_not_called()
+    assert dl.calls == []
     assert results[0]["status"] == "validation_failed"
     assert "no artifact location" in results[0]["error_message"].lower()
 
 
-def test_unreadable_source_surfaces_uri_and_validation_failed(monkeypatch):
-    """If create_model_version fails (e.g. target can't read source URI),
-    the offending URI is surfaced and the row is validation_failed so a
-    re-run retries after the operator grants access."""
+def test_download_failure_surfaces_and_validation_failed(monkeypatch):
+    """If the source-side artifact download fails (e.g. artifacts GC'd or
+    unreadable), the version is validation_failed with the error surfaced,
+    and create_model_version is not attempted for it."""
+    auth = _auth()
+    reg = _fake_registry(("1",))
+    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+
+    def _boom(auth, model_fqn, version):
+        raise RuntimeError("artifacts not found at source")
+
+    monkeypatch.setattr(models_worker, "_download_source_artifacts", _boom)
+
+    results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
+    reg.create_model_version.assert_not_called()
+    assert results[0]["status"] == "validation_failed"
+    assert "artifacts not found at source" in results[0]["error_message"]
+
+
+def test_register_failure_surfaces_and_validation_failed(monkeypatch):
+    """If target create_model_version fails, the row is validation_failed
+    with the error surfaced so a re-run retries."""
     auth = _auth()
     reg = MagicMock()
-    reg.create_model_version.side_effect = PermissionDenied("cannot read abfss://src/model/v1")
+    reg.create_model_version.side_effect = PermissionDenied("target register denied")
     monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+    monkeypatch.setattr(models_worker, "_download_source_artifacts", _fake_downloader())
 
     results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
     assert results[0]["status"] == "validation_failed"
-    assert "abfss://src/model/v1" in results[0]["error_message"]
+    assert "target register denied" in results[0]["error_message"]
 
 
 def test_aliases_applied_to_target_version_number(monkeypatch):
@@ -162,6 +195,7 @@ def test_aliases_applied_to_target_version_number(monkeypatch):
     # target allocates 10, 11, 12 for source versions 1, 2, 3
     reg = _fake_registry(("10", "11", "12"))
     monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+    monkeypatch.setattr(models_worker, "_download_source_artifacts", _fake_downloader())
 
     results = models_worker.apply_model(_model_with_three_versions(), auth=auth, dry_run=False)
 
@@ -178,6 +212,7 @@ def test_model_shell_created_on_target(monkeypatch):
     auth = _auth()
     reg = _fake_registry(("1",))
     monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+    monkeypatch.setattr(models_worker, "_download_source_artifacts", _fake_downloader())
 
     models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
     auth.target_client.registered_models.create.assert_called_once()
@@ -189,9 +224,29 @@ def test_model_shell_already_exists_is_idempotent(monkeypatch):
     auth.target_client.registered_models.create.side_effect = AlreadyExists("exists")
     reg = _fake_registry(("1",))
     monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+    monkeypatch.setattr(models_worker, "_download_source_artifacts", _fake_downloader())
 
     results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
     assert results[0]["status"] != "failed"
+
+
+def test_model_shell_already_exists_by_message_is_idempotent(monkeypatch):
+    """The runtime doesn't always map an existing-model error to the
+    AlreadyExists class — live it raised a generic error 'Routine or Model
+    <name> already exists'. Idempotency must be message-based, not solely
+    class-based, so a re-run continues to versions rather than failing."""
+    auth = _auth()
+    auth.target_client.registered_models.create.side_effect = Exception(
+        "Routine or Model 'm' already exists"
+    )
+    reg = _fake_registry(("1",))
+    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+    monkeypatch.setattr(models_worker, "_download_source_artifacts", _fake_downloader())
+
+    results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
+    # Must NOT be 'failed' — the shell already exists, proceed to versions.
+    assert results[0]["status"] != "failed"
+    reg.create_model_version.assert_called_once()
 
 
 def test_shell_create_permission_denied_is_failed(monkeypatch):
@@ -200,6 +255,7 @@ def test_shell_create_permission_denied_is_failed(monkeypatch):
     auth.target_client.registered_models.create.side_effect = PermissionDenied("nope")
     reg = _fake_registry(("1",))
     monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+    monkeypatch.setattr(models_worker, "_download_source_artifacts", _fake_downloader())
 
     results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
     assert results[0]["status"] == "failed"
@@ -207,14 +263,17 @@ def test_shell_create_permission_denied_is_failed(monkeypatch):
 
 
 def test_dry_run_creates_nothing(monkeypatch):
-    """dry_run records skipped and never calls MLflow or the SDK."""
+    """dry_run records skipped and never calls download, MLflow, or the SDK."""
     auth = _auth()
     reg = _fake_registry(("1",))
+    dl = _fake_downloader()
     monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+    monkeypatch.setattr(models_worker, "_download_source_artifacts", dl)
 
     results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=True)
     assert results[0]["status"] == "skipped"
     reg.create_model_version.assert_not_called()
+    assert dl.calls == []
     auth.target_client.registered_models.create.assert_not_called()
 
 
