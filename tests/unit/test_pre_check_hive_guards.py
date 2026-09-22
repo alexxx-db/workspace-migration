@@ -87,3 +87,60 @@ class TestTargetDbfsRootProbesTargetNotSource:
         )
         assert "target_dbfs_root_probe_verdict" in block
         assert "execute_and_poll" in block
+
+
+class TestTargetWarehouseDacProbeVerdict:
+    """Finding #25: the DBFS-root two-hop STAGE-2 and ADLS-backed Hive migration
+    write/read ``abfss://`` paths through the TARGET SQL warehouse, which needs a
+    Data Access Config (``fs.azure.account.key`` / OAuth). ``check_target_dbfs_root``
+    only created a *database* in the target's DEFAULT DBFS root — no ``abfss``, no
+    account key — so an empty DAC passed green and the migration then died mid-run
+    on ``fs.azure.account.key``. ``target_warehouse_dac_probe_verdict`` turns a
+    target-warehouse abfss create-probe result into a PASS/FAIL decision keyed off
+    the real missing-DAC signature."""
+
+    def test_succeeded_is_pass(self):
+        from pre_check.pre_check import target_warehouse_dac_probe_verdict
+
+        status, _ = target_warehouse_dac_probe_verdict({"state": "SUCCEEDED"})
+        assert status == "PASS"
+
+    def test_missing_account_key_is_fail(self):
+        from pre_check.pre_check import target_warehouse_dac_probe_verdict
+
+        res = {
+            "state": "FAILED",
+            "error": "Failure to initialize configuration for storage account "
+            "stextsourcemig36cd38.dfs.core.windows.net: Invalid configuration value "
+            "detected for fs.azure.account.key",
+        }
+        status, msg = target_warehouse_dac_probe_verdict(res)
+        assert status == "FAIL"
+        assert "data access" in msg.lower() or "account key" in msg.lower()
+
+    def test_other_failure_is_warn_not_false_pass(self):
+        from pre_check.pre_check import target_warehouse_dac_probe_verdict
+
+        # An unrelated failure must NOT be reported as PASS — degrade to WARN so
+        # it doesn't mask the real missing-DAC state.
+        status, _ = target_warehouse_dac_probe_verdict({"state": "FAILED", "error": "boom"})
+        assert status == "WARN"
+
+
+class TestTargetWarehouseDacCheckWired:
+    def test_check_probes_target_abfss_via_warehouse(self):
+        """The new #25 guard must actually exercise the DAC: create a table at an
+        ``abfss://`` LOCATION under the staging path on the TARGET warehouse
+        (execute_and_poll), gated on migrate_hive_dbfs_root, mapping via the
+        verdict helper. A DEFAULT-DBFS-root database create does NOT touch the
+        account key and cannot catch the gap."""
+        import pathlib
+
+        src = (pathlib.Path(__file__).resolve().parents[2] / "src" / "pre_check" / "pre_check.py").read_text()
+        assert "check_target_warehouse_dac" in src
+        start = src.index("check_target_warehouse_dac")
+        block = src[start : start + 1600]
+        assert "target_warehouse_dac_probe_verdict" in block
+        assert "execute_and_poll" in block
+        assert "abfss://" in block
+        assert "migrate_hive_dbfs_root" in block

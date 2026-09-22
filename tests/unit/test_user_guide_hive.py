@@ -25,3 +25,11 @@ class TestUserGuideHiveLikeForLike:
         # The retired UC-upgrade Hive config keys must not linger in the guide.
         assert "hive_target_catalog" not in _GUIDE
         assert "hive_dbfs_target_path" not in _GUIDE
+
+    def test_grants_file_access_on_staging_external_location(self):
+        # Finding #24: the Step 4 grant recipe must grant READ FILES + WRITE FILES
+        # on the external location backing hive_dbfs_staging_path. Without them the
+        # SPN's staging write (and the check_hive_dbfs_root_config probe) fails when
+        # migrate_hive_dbfs_root=true.
+        assert "GRANT READ FILES" in _GUIDE, "user_guide missing READ FILES grant for staging ext-loc"
+        assert "GRANT WRITE FILES" in _GUIDE, "user_guide missing WRITE FILES grant for staging ext-loc"
