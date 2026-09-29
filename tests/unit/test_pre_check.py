@@ -62,8 +62,8 @@ class TestPreCheck:
         # 10 core UC checks + 3 Hive/external-metastore checks +
         # 1 target-collision check (X.4) + 1 deploy-is-source guard (#3) +
         # 3 like-for-like Hive guards (target DBFS-root, /mnt mounts,
-        # staging-reachable) = 18
-        assert len(results) == 18
+        # staging-reachable) + 1 target-warehouse DAC guard (#25) = 19
+        assert len(results) == 19
         assert all(r["status"] in ("PASS", "WARN") for r in results)
         assert sum(1 for r in results if r["status"] == "FAIL") == 0
         _deploy = [r for r in results if r["check_name"] == "check_deploy_is_source"]

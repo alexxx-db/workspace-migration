@@ -391,6 +391,12 @@ GRANT USE CONNECTION ON CONNECTION `<conn>` TO `<spn-application-id>`;
 GRANT USE PROVIDER ON METASTORE   TO `<spn-application-id>`;
 ALTER SHARE     `<share_name>`     OWNER TO `<spn-application-id>`;
 ALTER RECIPIENT `<recipient_name>` OWNER TO `<spn-application-id>`;
+-- SOURCE, ONLY when migrate_hive_dbfs_root=true — the DBFS-root two-hop stages
+-- data through hive_dbfs_staging_path; the SPN's write probe (check_hive_dbfs_root_config)
+-- and STAGE-1 copy need file access on the external location backing that path.
+-- Grant these on BOTH workspaces' external location for the shared staging path:
+GRANT READ FILES  ON EXTERNAL LOCATION `<staging-ext-loc>` TO `<spn-application-id>`;
+GRANT WRITE FILES ON EXTERNAL LOCATION `<staging-ext-loc>` TO `<spn-application-id>`;
 ```
 ```sql
 -- TARGET

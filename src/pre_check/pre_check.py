@@ -92,6 +92,41 @@ def target_dbfs_root_probe_verdict(result: dict) -> tuple[str, str]:
     return "WARN", f"Could not confirm target DBFS-root writability: {err[:200]}"
 
 
+def target_warehouse_dac_probe_verdict(result: dict) -> tuple[str, str]:
+    """Turn a target-warehouse abfss-write probe result into a (status, message).
+
+    The DBFS-root two-hop STAGE-2 and ADLS-backed Hive migration create/read
+    ``abfss://`` locations through the TARGET SQL warehouse, which needs a Data
+    Access Config (``fs.azure.account.key`` or an OAuth service principal) for
+    the staging storage account. The default-DBFS-root database probe only
+    created a *database* in the target's DEFAULT DBFS root — that path never
+    touches the account key — so an empty DAC passed green and the migration then
+    failed mid-run on ``fs.azure.account.key``. This probe creates a table at
+    an ``abfss`` LOCATION on the target warehouse; this maps its outcome:
+
+    - SUCCEEDED → PASS.
+    - FAILED with the missing/invalid account-key signature → FAIL: surface the
+      exact ``fs.azure.account.key`` error the orchestrator hits mid-migration at
+      preflight instead, with the fix (configure the target warehouse DAC).
+    - Any other FAILED → WARN (don't false-PASS, but don't mask a real gap
+      behind a transient warehouse error either).
+    """
+    if result.get("state") == "SUCCEEDED":
+        return "PASS", "Target warehouse can read/write the abfss staging location."
+    err = str(result.get("error", result.get("state", "")) or "")
+    if (
+        "fs.azure.account.key" in err
+        or "Failure to initialize configuration for storage account" in err
+    ):
+        return (
+            "FAIL",
+            "Target warehouse Data Access Config is missing the storage account key "
+            "for the abfss staging location — ADLS-backed Hive migration and the "
+            f"DBFS-root two-hop will fail mid-run: {err[:200]}",
+        )
+    return "WARN", f"Could not confirm target warehouse abfss access: {err[:200]}"
+
+
 # COMMAND ----------
 
 
@@ -612,6 +647,44 @@ def run(dbutils, spark):  # noqa: D103
             _add("check_target_dbfs_root", status, message, action)
     except Exception as e:  # noqa: BLE001
         _add("check_target_dbfs_root", "WARN", f"Could not probe target DBFS root: {e}")
+
+    # 14b-2 (#25). check_target_warehouse_dac — the DBFS-root two-hop STAGE-2 and
+    # ADLS-backed Hive migration write/read abfss:// through the TARGET warehouse,
+    # which needs a Data Access Config (fs.azure.account.key / OAuth). The default
+    # DBFS-root database probe never touches the account key, so an empty DAC
+    # passed green and migration died mid-run. Probe migrate_hive_dbfs_root here.
+    try:
+        if not config.migrate_hive_dbfs_root or not config.hive_dbfs_staging_path:
+            _add(
+                "check_target_warehouse_dac",
+                "PASS",
+                "abfss-backed DBFS-root Hive migration not requested — DAC not required.",
+            )
+        else:
+            from common.sql_utils import execute_and_poll, find_warehouse
+
+            _t_wh = find_warehouse(auth)  # defaults to the TARGET workspace
+            ts = __import__("time").strftime("%H%M%S")
+            probe_loc = config.hive_dbfs_staging_path.rstrip("/") + f"/.wsm_dac_probe_{ts}"
+            probe_tbl = f"hive_metastore.default.__wsm_dac_probe_{ts}"
+            res = execute_and_poll(
+                auth, _t_wh, f"CREATE TABLE {probe_tbl} (x INT) USING DELTA LOCATION '{probe_loc}'"
+            )
+            status, message = target_warehouse_dac_probe_verdict(res)
+            # Best-effort cleanup if the table did get created.
+            if res.get("state") == "SUCCEEDED":
+                execute_and_poll(auth, _t_wh, f"DROP TABLE IF EXISTS {probe_tbl}")
+            action = (
+                "Configure the target SQL warehouse Data Access Config with the storage "
+                "account key or an OAuth service principal for the staging account "
+                "(e.g. spark.hadoop.fs.azure.account.key.<acct>.dfs.core.windows.net="
+                "{{secrets/<scope>/<key>}}), then restart the warehouse."
+                if status == "FAIL"
+                else ""
+            )
+            _add("check_target_warehouse_dac", status, message, action)
+    except Exception as e:  # noqa: BLE001
+        _add("check_target_warehouse_dac", "WARN", f"Could not probe target warehouse abfss access: {e}")
 
     # 14c. check_target_mounts — every /mnt mount required by a /mnt-backed Hive
     # table (mount_prerequisite markers from discovery) must already exist on the
