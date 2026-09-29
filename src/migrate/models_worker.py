@@ -138,6 +138,31 @@ def _download_source_artifacts(auth: AuthManager, model_fqn: str, version: str) 
     return mlflow.artifacts.download_artifacts(artifact_uri=f"models:/{model_fqn}/{version}")
 
 
+def _neutralize_logged_model_reference(local_path: str) -> None:
+    """Strip the source ``model_id`` (MLflow-3 LoggedModel reference) from a
+    staged version's ``MLmodel`` file before registering it on the target.
+
+    MLflow 3 records ``model_id: m-<id>`` in ``MLmodel`` pointing at the source
+    workspace's LoggedModel. ``create_model_version(source=<local dir>)`` reads
+    it and tries to resolve that LoggedModel in the TARGET workspace, which does
+    not have it (runs/experiments/LoggedModels are out of migration scope) → it
+    dies ``NOT_FOUND: LoggedModel m-<id> not found`` (#26, live 2026-09-29).
+    Removing the line lets the version register from the artifacts alone, with
+    no cross-workspace LoggedModel linkage. No-op if there is no MLmodel file.
+    """
+    import os
+
+    mlmodel = os.path.join(local_path, "MLmodel")
+    if not os.path.exists(mlmodel):
+        return
+    with open(mlmodel) as fh:
+        lines = fh.readlines()
+    kept = [ln for ln in lines if not ln.lstrip().startswith("model_id:")]
+    if len(kept) != len(lines):
+        with open(mlmodel, "w") as fh:
+            fh.writelines(kept)
+
+
 def apply_model(
     model: dict,
     *,
@@ -222,8 +247,19 @@ def apply_model(
     version_errors: list[str] = []
 
     # Phase A — source-side downloads (ambient source auth; no target env yet).
+    # Register OLDEST-first: discovery lists versions newest-first
+    # (model_versions.list returns DESC), but MLflow allocates target version
+    # numbers sequentially in registration order — registering newest-first
+    # inverts them (target v1 = source vN). Sort ascending by source version so
+    # target numbers line up with source, and aliases land on the right number (#27).
+    def _ver_key(v: dict) -> int:
+        try:
+            return int(v.get("version"))
+        except (TypeError, ValueError):
+            return 0
+
     staged: list[dict] = []  # {source_version, run_id, aliases, local_path}
-    for v in model.get("versions", []):
+    for v in sorted(model.get("versions", []), key=_ver_key):
         source_version = v.get("version", "?")
         # A version with no artifact location at all can't be moved
         # (external / GC'd artifacts — scenario E).
@@ -259,11 +295,20 @@ def apply_model(
     for s in staged:
         source_version = s["source_version"]
         local_path = s["local_path"]
+        # Strip the source LoggedModel reference from the staged MLmodel so the
+        # target create_model_version doesn't try to resolve a cross-workspace
+        # LoggedModel that isn't there (#26).
+        _neutralize_logged_model_reference(local_path)
         try:
+            # run_id is deliberately NOT forwarded: the source run / MLflow-3
+            # LoggedModel exists only in the source workspace (runs and
+            # experiments are out of migration scope), so passing it makes the
+            # target registry resolve a LoggedModel that isn't there and fail
+            # with "NOT_FOUND: LoggedModel m-<id> not found" (#26). The version
+            # registers fine from the staged local artifacts without it.
             created = registry.create_model_version(
                 name=full_name,
                 source=local_path,
-                run_id=s["run_id"],
             )
             versions_created += 1
         except AlreadyExists as exc:  # noqa: BLE001

@@ -123,15 +123,88 @@ def test_version_registered_from_local_download_not_source_uri(monkeypatch):
     assert not auth.target_client.model_versions.create.called
 
 
-def test_run_id_passed_through(monkeypatch):
-    """Original run_id is preserved when present (provenance)."""
+def test_versions_registered_in_ascending_source_order(monkeypatch):
+    """Discovery lists model versions newest-first (``model_versions.list``
+    returns DESC), but they must be REGISTERED oldest-first so target version
+    numbers line up with source (target vN corresponds to source vN) instead of
+    being inverted (#27, live 2026-09-29: source champion=v3 landed as target
+    v1). The champion alias must then land on the target version created from
+    source v3 (the last one)."""
+    auth = _auth()
+    reg = _fake_registry(("1", "2", "3"))
+    dl = _fake_downloader()
+    monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
+    monkeypatch.setattr(models_worker, "_download_source_artifacts", dl)
+    # Versions arrive newest-first, exactly as the SDK list returns them.
+    model = {
+        "model_fqn": "c.s.churn",
+        "comment": None,
+        "storage_location": None,
+        "versions": [
+            {"version": "3", "source": "runs:/r3/m", "storage_location": "abfss://x/v3",
+             "run_id": "r3", "aliases": ["champion"]},
+            {"version": "2", "source": "runs:/r2/m", "storage_location": "abfss://x/v2",
+             "run_id": "r2", "aliases": []},
+            {"version": "1", "source": "runs:/r1/m", "storage_location": "abfss://x/v1",
+             "run_id": "r1", "aliases": []},
+        ],
+    }
+    models_worker.apply_model(model, auth=auth, dry_run=False)
+    # Registered oldest-first: create_model_version called with v1, v2, v3 paths in order.
+    sources = [c["source"] for c in reg._created]
+    assert sources == [
+        "/local_disk0/dl/c.s.churn/1",
+        "/local_disk0/dl/c.s.churn/2",
+        "/local_disk0/dl/c.s.churn/3",
+    ]
+    # champion (source v3) → the LAST-created target version (3), not v1.
+    auth.target_client.registered_models.set_alias.assert_called_once_with(
+        full_name="c.s.churn", alias="champion", version_num=3
+    )
+
+
+def test_logged_model_reference_neutralized_in_mlmodel(tmp_path):
+    """MLflow 3 embeds ``model_id: m-<id>`` (the source LoggedModel) in the
+    staged MLmodel file. Left in place, the target create_model_version tries
+    to resolve that LoggedModel cross-workspace and dies
+    ``NOT_FOUND: LoggedModel m-<id> not found`` (#26, live 2026-09-29,
+    mlflow 3.16.1). The worker must strip the reference from the staged
+    artifacts before registering; the rest of the MLmodel is preserved."""
+    mlmodel = tmp_path / "MLmodel"
+    mlmodel.write_text(
+        "artifact_path: dbfs:/.../logged_models/m-a88f/artifacts\n"
+        "flavors:\n  sklearn:\n    pickled_model: model.skops\n"
+        "model_id: m-a88fd905e78a40acb0602a8a20eac886\n"
+        "mlflow_version: 3.16.1\n"
+    )
+    models_worker._neutralize_logged_model_reference(str(tmp_path))
+    txt = mlmodel.read_text()
+    assert "model_id:" not in txt
+    assert "flavors:" in txt and "pickled_model: model.skops" in txt
+
+
+def test_neutralize_logged_model_reference_no_mlmodel_is_noop(tmp_path):
+    """No MLmodel file (e.g. non-standard artifact layout) → helper is a no-op,
+    never raises, so the register attempt still proceeds."""
+    models_worker._neutralize_logged_model_reference(str(tmp_path))  # must not raise
+
+
+def test_source_run_id_not_passed_to_target(monkeypatch):
+    """The source run_id must NOT be forwarded to the target
+    create_model_version. The source run / MLflow-3 LoggedModel exists only in
+    the source workspace (runs/experiments are out of migration scope), so
+    passing it makes the target registry try to resolve a LoggedModel that does
+    not exist there and fail with ``NOT_FOUND: LoggedModel m-<id> not found``
+    (finding #26, live 2026-09-29). Registering from the staged local artifacts
+    needs no run linkage, so run_id is dropped."""
     auth = _auth()
     reg = _fake_registry(("1",))
     monkeypatch.setattr(models_worker, "_registry_client", lambda a: reg)
     monkeypatch.setattr(models_worker, "_download_source_artifacts", _fake_downloader())
 
-    models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
-    assert reg._created[0]["run_id"] == "abc"
+    results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
+    assert reg._created[0]["run_id"] is None
+    assert results[0]["status"] == "validated"
 
 
 def test_version_with_no_artifact_location_is_skipped_not_crashed(monkeypatch):
